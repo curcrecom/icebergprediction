@@ -1,0 +1,1314 @@
+import os
+import sys
+import time
+import math
+import json
+import asyncio
+import logging
+import datetime
+import threading
+import argparse
+from functools import wraps, partial
+from typing import Any, Dict, Tuple, List, Optional, Callable, Union
+
+import concurrent.futures
+import multiprocessing as mp
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from numpy.linalg import svd
+
+# -----------------------------
+# Third-Party and Optimization Libraries
+# -----------------------------
+try:
+    from numba import njit, prange
+except ImportError as e:
+    sys.exit("Please install numba (pip install numba)")
+
+try:
+    import pyopencl as cl
+except ImportError:
+    sys.exit("Please install pyopencl (pip install pyopencl)")
+
+try:
+    import jax
+    import jax.numpy as jnp
+    from jax import jit, grad, lax, random
+except ImportError:
+    sys.exit("Please install JAX (pip install jax jaxlib)")
+
+try:
+    from transformers import pipeline
+except ImportError:
+    sys.exit("Please install transformers (pip install transformers)")
+
+try:
+    from bayes_opt import BayesianOptimization
+except ImportError:
+    sys.exit("Please install bayesian-optimization (pip install bayesian-optimization)")
+
+try:
+    import dash
+    from dash import dcc, html, Output, Input
+    import dash_bootstrap_components as dbc
+except ImportError:
+    sys.exit("Please install dash and dash-bootstrap-components (pip install dash dash-bootstrap-components)")
+
+# -----------------------------
+# Configuration
+# -----------------------------
+CACHE_FILE: str = 'data_cache.json'
+LOG_FILE: str = "model_log.txt"
+RUN_DAY: int = 0  # Monday (0) for scheduling run at close
+RUN_HOUR: int = 16
+
+# -----------------------------
+# Custom Exception Classes
+# -----------------------------
+class NetworkError(Exception):
+    """Exception raised for network-related errors."""
+    pass
+
+class DataFetchError(Exception):
+    """Exception raised when data fetching fails."""
+    pass
+
+class GPUInitializationError(Exception):
+    """Exception raised when GPU accelerator initialization fails."""
+    pass
+
+class ModelTrainingError(Exception):
+    """Exception raised during model training errors."""
+    pass
+
+# -----------------------------
+# Logger Configuration
+# -----------------------------
+logger: logging.Logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setFormatter(formatter)
+file_handler = logging.FileHandler(LOG_FILE, mode='w')
+file_handler.setFormatter(formatter)
+logger.addHandler(stream_handler)
+logger.addHandler(file_handler)
+
+# -----------------------------
+# Retry Decorators
+# -----------------------------
+def retry(
+    exceptions: Tuple[Exception, ...],
+    tries: int = 3,
+    delay: float = 1,
+    backoff: int = 2
+) -> Callable:
+    """
+    Synchronous retry decorator.
+    """
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            mtries, mdelay = tries, delay
+            while mtries > 1:
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    logger.error(f"{func.__name__} failed with {e}, retrying in {mdelay} seconds...")
+                    time.sleep(mdelay)
+                    mtries -= 1
+                    mdelay *= backoff
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+def async_retry(
+    exceptions: Tuple[Exception, ...],
+    tries: int = 3,
+    delay: float = 1,
+    backoff: int = 2
+) -> Callable:
+    """
+    Asynchronous retry decorator.
+    """
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            mtries, mdelay = tries, delay
+            while mtries > 1:
+                try:
+                    return await func(*args, **kwargs)
+                except exceptions as e:
+                    logger.error(f"{func.__name__} (async) failed with {e}, retrying in {mdelay} seconds...")
+                    await asyncio.sleep(mdelay)
+                    mtries -= 1
+                    mdelay *= backoff
+            return await func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+# -----------------------------
+# Profiling Decorator
+# -----------------------------
+def profile(func: Callable) -> Callable:
+    """
+    Simple performance profiling decorator.
+    """
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        end = time.perf_counter()
+        logger.info(f"{func.__name__} took {end - start:.4f} seconds")
+        return result
+    return wrapper
+
+# -----------------------------
+# Atomic Cache Save (Improved Caching)
+# -----------------------------
+def atomic_save(cache: Dict[str, Any], filename: str) -> None:
+    """
+    Atomically save the cache dictionary to a file.
+    """
+    temp_filename = filename + ".tmp"
+    try:
+        with open(temp_filename, 'w') as f:
+            json.dump(cache, f)
+        os.replace(temp_filename, filename)
+    except Exception as e:
+        logger.error(f"Error saving cache: {e}")
+
+# -----------------------------
+# Optimized CPU Kernel using Numba
+# -----------------------------
+@njit(parallel=True, fastmath=True)
+def fast_cpu_distance(x: np.ndarray, y: np.ndarray) -> float:
+    """
+    Compute the squared Euclidean distance between two vectors using SIMD parallelism.
+    """
+    n = x.shape[0]
+    total = 0.0
+    for i in prange(n):
+        diff = x[i] - y[i]
+        total += diff * diff
+    return total
+
+# -----------------------------
+# GPU Accelerator using PyOpenCL for Multi-Device Batching
+# -----------------------------
+class GPUAccelerator:
+    """
+    GPU accelerator that distributes workload across discrete and integrated GPUs.
+
+    It creates separate contexts and command queues for each target device (e.g., AMD Radeon Pro 5300M and
+    Intel UHD Graphics 630) and batches computations between them.
+    """
+    def __init__(self) -> None:
+        self.devices: List[cl.Device] = []
+        self.contexts: Dict[str, cl.Context] = {}
+        self.queues: Dict[str, cl.CommandQueue] = {}
+        try:
+            platforms = cl.get_platforms()
+            if not platforms:
+                raise GPUInitializationError("No OpenCL platforms found.")
+            # Enumerate and select devices from each platform
+            for platform in platforms:
+                for dev in platform.get_devices():
+                    vendor = dev.vendor.lower()
+                    if "amd" in vendor and "radeon pro 5300m" in dev.name.lower():
+                        self.devices.append(dev)
+                        self.contexts["dGPU"] = cl.Context(devices=[dev])
+                        self.queues["dGPU"] = cl.CommandQueue(self.contexts["dGPU"],
+                                                              properties=cl.command_queue_properties.OUT_OF_ORDER_EXEC_MODE_ENABLE)
+                    elif "intel" in vendor and "uhd graphics" in dev.name.lower():
+                        self.devices.append(dev)
+                        self.contexts["iGPU"] = cl.Context(devices=[dev])
+                        self.queues["iGPU"] = cl.CommandQueue(self.contexts["iGPU"],
+                                                              properties=cl.command_queue_properties.OUT_OF_ORDER_EXEC_MODE_ENABLE)
+            if not self.devices:
+                raise GPUInitializationError("Required GPUs (dGPU or iGPU) not found.")
+            logger.info(f"GPU Accelerator initialized with devices: {[dev.name for dev in self.devices]}")
+        except Exception as e:
+            logger.error(f"Failed to initialize GPU accelerator: {e}")
+            raise GPUInitializationError(e)
+
+        # Define kernel code for vector multiplication.
+        self.kernel_code: str = """
+        __kernel void vec_mult(__global const double* a,
+                               __global const double* b,
+                               __global double* result,
+                               const int n) {
+            int gid = get_global_id(0);
+            if (gid < n)
+                result[gid] = a[gid] * b[gid];
+        }
+        """
+        # Build program for each device context
+        self.programs: Dict[str, cl.Program] = {}
+        for key, ctx in self.contexts.items():
+            try:
+                program = cl.Program(ctx, self.kernel_code).build()
+                self.programs[key] = program
+            except Exception as e:
+                logger.error(f"Kernel build failed on {key}: {e}")
+                raise GPUInitializationError(e)
+
+    def vector_multiply(self, a_np: np.ndarray, b_np: np.ndarray) -> np.ndarray:
+        """
+        Multiply two vectors using available GPUs by batching the work between them.
+        """
+        a = np.array(a_np, dtype=np.float64)
+        b = np.array(b_np, dtype=np.float64)
+        n_total = a.shape[0]
+        result = np.empty_like(a)
+
+        # Partition work roughly equally among available GPUs
+        device_keys = list(self.programs.keys())
+        batch_sizes = np.linspace(0, n_total, len(device_keys) + 1, dtype=int)
+        threads: List[threading.Thread] = []
+
+        def run_kernel(dev_key: str, start: int, end: int) -> None:
+            n = end - start
+            if n <= 0:
+                return
+            ctx = self.contexts[dev_key]
+            queue = self.queues[dev_key]
+            program = self.programs[dev_key]
+            mf = cl.mem_flags
+            a_batch = a[start:end]
+            b_batch = b[start:end]
+            res_batch = np.empty_like(a_batch)
+            try:
+                a_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=a_batch)
+                b_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=b_batch)
+                res_buf = cl.Buffer(ctx, mf.WRITE_ONLY, res_batch.nbytes)
+                event = program.vec_mult(queue, (n,), None, a_buf, b_buf, res_buf, np.int32(n))
+                cl.enqueue_copy(queue, res_batch, res_buf, wait_for=[event])
+                result[start:end] = res_batch
+            except Exception as e:
+                logger.error(f"GPU kernel execution failed on {dev_key}: {e}")
+                raise
+
+        for i, key in enumerate(device_keys):
+            start = int(batch_sizes[i])
+            end = int(batch_sizes[i + 1])
+            t = threading.Thread(target=run_kernel, args=(key, start, end))
+            threads.append(t)
+            t.start()
+
+        for t in threads:
+            t.join()
+
+        return result
+
+# -----------------------------
+# FinBERT-based Sentiment Transformer
+# -----------------------------
+class SentimentTransformer:
+    """
+    Transformer using FinBERT for sentiment analysis.
+    """
+    def __init__(self) -> None:
+        try:
+            self.pipeline = pipeline("sentiment-analysis", model="yiyanghkust/finbert-pretrain", 
+                                     tokenizer="yiyanghkust/finbert-pretrain")
+            logger.info("Loaded FinBERT-based sentiment transformer.")
+        except Exception as e:
+            logger.error(f"Failed to load FinBERT transformer: {e}")
+            raise
+
+    def analyze(self, text: str) -> float:
+        """
+        Analyze text and return a sentiment score.
+        """
+        result = self.pipeline(text[:512])
+        if result and result[0]['label'].upper() == "POSITIVE":
+            return result[0]['score']
+        elif result and result[0]['label'].upper() == "NEGATIVE":
+            return -result[0]['score']
+        else:
+            return 0.0
+
+    @staticmethod
+    def analyze_static(text: str) -> float:
+        return SentimentTransformer().analyze(text)
+
+# -----------------------------
+# Data Fetching & Caching with Async Optimization
+# -----------------------------
+class DataFetcher:
+    """
+    Data fetching and caching utility.
+    """
+    def __init__(self, cache_file: str = CACHE_FILE) -> None:
+        self.cache_file: str = cache_file
+        self.cache: Dict[str, Any] = {}
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'r') as f:
+                    self.cache = json.load(f)
+            except Exception as e:
+                logger.error(f"Error loading cache: {e}")
+                self.cache = {}
+        self._sentiment_transformer: Optional[SentimentTransformer] = None
+
+    def save_cache(self) -> None:
+        """
+        Save the current cache to file atomically.
+        """
+        atomic_save(self.cache, self.cache_file)
+
+    @retry((DataFetchError, Exception), tries=3, delay=2, backoff=2)
+    async def async_fetch_stock_data(self, ticker: str, period: str = '5y') -> pd.DataFrame:
+        """
+        Asynchronously fetch stock data for a ticker using yfinance with caching.
+        Note: yfinance itself is synchronous; we offload it to a thread.
+        """
+        loop = asyncio.get_event_loop()
+        if ticker in self.cache:
+            logger.info(f"Loading cached data for ticker: {ticker}")
+            df = pd.read_json(self.cache[ticker], convert_dates=True)
+        else:
+            logger.info(f"Fetching data from yfinance for ticker: {ticker}")
+            try:
+                df = await loop.run_in_executor(None, lambda: yf.Ticker(ticker).history(period=period))
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = ['_'.join(col).strip() for col in df.columns.values]
+                self.cache[ticker] = df.to_json(date_format='iso')
+                self.save_cache()
+            except Exception as e:
+                logger.error(f"Error fetching data for {ticker}: {e}")
+                raise DataFetchError(e)
+        return df
+
+    @async_retry((NetworkError, Exception), tries=3, delay=2, backoff=2)
+    async def fetch_news_sentiment(self, ticker: str) -> float:
+        """
+        Asynchronously fetch sentiment score from multiple news sources.
+        """
+        import aiohttp
+        from bs4 import BeautifulSoup
+        urls: List[str] = [
+            f"https://www.businesswire.com/portal/site/home/?search={ticker}",
+            f"https://www.reuters.com/search/news?blob={ticker}",
+            f"https://www.bloomberg.com/search?query={ticker}"
+        ]
+        sentiment_scores: List[float] = []
+        if self._sentiment_transformer is None:
+            self._sentiment_transformer = SentimentTransformer()
+        async with aiohttp.ClientSession() as session:
+            async def fetch(url: str) -> None:
+                try:
+                    async with session.get(url) as response:
+                        if response.status == 200:
+                            text = await response.text()
+                            soup = BeautifulSoup(text, 'html.parser')
+                            texts = " ".join(p.get_text() for p in soup.find_all('p'))
+                            score = self._sentiment_transformer.analyze(texts)
+                            sentiment_scores.append(score)
+                except Exception as ex:
+                    logger.error(f"Error fetching news from {url}: {ex}")
+            await asyncio.gather(*(fetch(url) for url in urls))
+        return np.mean(sentiment_scores) if sentiment_scores else 0.0
+
+# -----------------------------
+# Hidden Markov Model (HMM)
+# -----------------------------
+class HiddenMarkovModel:
+    """
+    Hidden Markov Model with EM fitting.
+    """
+    def __init__(self, n_states: int = 2, seed: Optional[int] = None) -> None:
+        self.n_states: int = n_states
+        if seed is not None:
+            np.random.seed(seed)
+        self.trans_mat: np.ndarray = np.full((n_states, n_states), 1.0 / n_states)
+        self.means: np.ndarray = np.random.randn(n_states)
+        self.vars: np.ndarray = np.ones(n_states)
+        self.pi: np.ndarray = np.full(n_states, 1.0 / n_states)
+
+    def _emission_probs(self, observations: np.ndarray) -> np.ndarray:
+        """
+        Calculate the emission probabilities for the observations.
+        """
+        T: int = observations.shape[0]
+        obs = observations.reshape(-1, 1)
+        coef = 1.0 / np.sqrt(2 * math.pi * self.vars)
+        exponents = -((obs - self.means) ** 2) / (2 * self.vars)
+        return coef * np.exp(exponents)
+
+    @profile
+    def _fit_single(self, observations: np.ndarray, n_iter: int = 10) -> float:
+        """
+        Fit the HMM using the EM algorithm.
+        """
+        T: int = observations.shape[0]
+        log_likelihood: float = -np.inf
+        for iteration in range(n_iter):
+            E = self._emission_probs(observations)
+            alpha = np.zeros((T, self.n_states))
+            scale = np.zeros(T)
+            alpha[0] = self.pi * E[0]
+            scale[0] = alpha[0].sum()
+            alpha[0] /= (scale[0] + 1e-12)
+            for t in range(1, T):
+                alpha[t] = E[t] * np.dot(alpha[t - 1], self.trans_mat)
+                scale[t] = alpha[t].sum()
+                alpha[t] /= (scale[t] + 1e-12)
+            beta = np.zeros((T, self.n_states))
+            beta[T - 1] = np.ones(self.n_states) / (scale[T - 1] + 1e-12)
+            for t in range(T - 2, -1, -1):
+                beta[t] = np.dot(self.trans_mat, (E[t + 1] * beta[t + 1]))
+                beta[t] /= (scale[t] + 1e-12)
+            gamma = alpha * beta
+            gamma /= (gamma.sum(axis=1, keepdims=True) + 1e-12)
+            num = alpha[:-1, :, None] * self.trans_mat[None, :, :] * E[1:, None, :] * beta[1:, None, :]
+            denom = num.sum(axis=(1, 2), keepdims=True) + 1e-12
+            xi = num / denom
+            self.trans_mat = xi.sum(axis=0) / (xi.sum(axis=(0, 2), keepdims=True) + 1e-12)
+            self.trans_mat = self.trans_mat.squeeze()
+            gamma_sum = gamma.sum(axis=0)
+            self.means = (gamma * observations.reshape(-1, 1)).sum(axis=0) / (gamma_sum + 1e-12)
+            self.vars = (gamma * (observations.reshape(-1, 1) - self.means) ** 2).sum(axis=0) / (gamma_sum + 1e-12)
+            self.pi = gamma[0]
+            log_likelihood = np.sum(np.log(scale + 1e-12))
+            logger.debug(f"HMM Iteration {iteration+1}/{n_iter}, Log Likelihood: {log_likelihood:.4f}")
+        return log_likelihood
+
+    def fit(self, observations: np.ndarray, n_iter: int = 10, parallel: bool = False, n_init: int = 1) -> float:
+        """
+        Fit the HMM model.
+        """
+        if parallel and n_init > 1:
+            best_model = fit_parallel_hmm(observations, self.n_states, n_iter, n_init)
+            self.trans_mat = best_model.trans_mat
+            self.means = best_model.means
+            self.vars = best_model.vars
+            self.pi = best_model.pi
+            log_likelihood = np.sum(np.log(self._emission_probs(observations).sum(axis=1) + 1e-12))
+            logger.info(f"Selected best HMM from parallel fits with log likelihood: {log_likelihood:.4f}")
+            return log_likelihood
+        else:
+            return self._fit_single(observations, n_iter)
+
+    def predict(self, observations: np.ndarray) -> np.ndarray:
+        """
+        Predict the state sequence for the observations.
+        """
+        T: int = observations.shape[0]
+        N: int = self.n_states
+        E = self._emission_probs(observations)
+        delta = np.zeros((T, N))
+        psi = np.zeros((T, N), dtype=int)
+        delta[0] = np.log(self.pi + 1e-12) + np.log(E[0] + 1e-12)
+        for t in range(1, T):
+            for j in range(N):
+                temp = delta[t - 1] + np.log(self.trans_mat[:, j] + 1e-12)
+                psi[t, j] = np.argmax(temp)
+                delta[t, j] = np.max(temp) + np.log(E[t, j] + 1e-12)
+        states = np.zeros(T, dtype=int)
+        states[T - 1] = np.argmax(delta[T - 1])
+        for t in range(T - 2, -1, -1):
+            states[t] = psi[t + 1, states[t + 1]]
+        return states
+
+def _fit_instance_hmm(observations: np.ndarray, n_states: int, n_iter: int, seed: int) -> dict:
+    """
+    Helper to fit a single HMM instance for parallel processing.
+    """
+    model = HiddenMarkovModel(n_states=n_states, seed=seed)
+    ll = model._fit_single(observations, n_iter)
+    return {
+        'log_likelihood': ll,
+        'trans_mat': model.trans_mat,
+        'means': model.means,
+        'vars': model.vars,
+        'pi': model.pi
+    }
+
+def fit_parallel_hmm(observations: np.ndarray, n_states: int, n_iter: int = 10, n_init: int = 4) -> HiddenMarkovModel:
+    """
+    Fit HMM in parallel and select the best model.
+    """
+    best_result = None
+    best_ll = -np.inf
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        futures = [executor.submit(_fit_instance_hmm, observations, n_states, n_iter, seed)
+                   for seed in range(n_init)]
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            if res['log_likelihood'] > best_ll:
+                best_ll = res['log_likelihood']
+                best_result = res
+    best_model = HiddenMarkovModel(n_states=n_states)
+    best_model.trans_mat = best_result['trans_mat']
+    best_model.means = best_result['means']
+    best_model.vars = best_result['vars']
+    best_model.pi = best_result['pi']
+    logger.info(f"Best log likelihood from parallel HMM fits: {best_ll:.4f}")
+    return best_model
+
+# -----------------------------
+# Technical Indicators & Option Pricing
+# -----------------------------
+class TechnicalIndicators:
+    """
+    Collection of technical indicators.
+    """
+    @staticmethod
+    def WMA(series: pd.Series, period: int) -> pd.Series:
+        """Weighted Moving Average (also used for LWMA)."""
+        weights = np.arange(1, period + 1)
+        return series.rolling(period).apply(lambda prices: np.dot(prices, weights) / weights.sum(), raw=True)
+
+    @staticmethod
+    def DEMA(series: pd.Series, period: int) -> pd.Series:
+        """Double Exponential Moving Average."""
+        ema = series.ewm(span=period, adjust=False).mean()
+        return 2 * ema - ema.ewm(span=period, adjust=False).mean()
+
+    @staticmethod
+    def TEMA(series: pd.Series, period: int) -> pd.Series:
+        """Triple Exponential Moving Average."""
+        ema = series.ewm(span=period, adjust=False).mean()
+        ema_ema = ema.ewm(span=period, adjust=False).mean()
+        ema_ema_ema = ema_ema.ewm(span=period, adjust=False).mean()
+        return 3 * (ema - ema_ema) + ema_ema_ema
+
+    @staticmethod
+    def SSMA(series: pd.Series, period: int) -> pd.Series:
+        """Smoothed Simple Moving Average."""
+        return series.rolling(period).mean().ewm(alpha=1 / period, adjust=False).mean()
+
+    @staticmethod
+    def VWMA(series: pd.Series, volume: pd.Series, period: int) -> pd.Series:
+        """Volume Weighted Moving Average."""
+        return (series * volume).rolling(period).sum() / volume.rolling(period).sum()
+
+    @staticmethod
+    def HMA(series: pd.Series, period: int) -> pd.Series:
+        """Hull Moving Average."""
+        half = int(period / 2)
+        sqrt = int(np.sqrt(period))
+        wma_half = TechnicalIndicators.WMA(series, half)
+        wma_full = TechnicalIndicators.WMA(series, period)
+        diff = 2 * wma_half - wma_full
+        return TechnicalIndicators.WMA(diff, sqrt)
+
+    @staticmethod
+    def KAMA(series: pd.Series, period: int, fast: int = 2, slow: int = 30) -> pd.Series:
+        """Kaufman Adaptive Moving Average."""
+        change = abs(series.diff(period))
+        volatility = series.diff().abs().rolling(period).sum()
+        er = change / volatility.replace(0, np.nan)
+        sc = ((er * (fast - slow)) + slow) ** 2
+        kama = [series.iloc[0]]
+        for i in range(1, len(series)):
+            kama.append(kama[-1] + sc.iloc[i] * (series.iloc[i] - kama[-1]))
+        return pd.Series(kama, index=series.index)
+
+    @staticmethod
+    def ALMA(series: pd.Series, window: int, offset: float = 0.85, sigma: float = 6) -> pd.Series:
+        """Arnaud Legoux Moving Average."""
+        m = offset * (window - 1)
+        s = window / sigma
+        weights = np.array([np.exp(-((i - m) ** 2) / (2 * s * s)) for i in range(window)])
+        weights /= weights.sum()
+        return series.rolling(window).apply(lambda x: np.dot(x, weights), raw=True)
+
+    @staticmethod
+    def GMA(series: pd.Series, period: int) -> pd.Series:
+        """Geometric Moving Average."""
+        return series.rolling(period).apply(lambda x: np.exp(np.mean(np.log(x[x > 0]))), raw=True)
+
+    @staticmethod
+    def MACD(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+        """Moving Average Convergence Divergence."""
+        ema_fast = series.ewm(span=fast, adjust=False).mean()
+        ema_slow = series.ewm(span=slow, adjust=False).mean()
+        macd_line = ema_fast - ema_slow
+        signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+        return macd_line, signal_line, macd_line - signal_line
+
+    @staticmethod
+    def VWAP(df: pd.DataFrame) -> pd.Series:
+        """Volume Weighted Average Price."""
+        pv = df['Close'] * df['Volume']
+        return pv.cumsum() / df['Volume'].cumsum()
+
+    @staticmethod
+    def stochastic_oscillator(df: pd.DataFrame, k_period: int = 14, d_period: int = 3) -> Tuple[pd.Series, pd.Series]:
+        """Stochastic Oscillator."""
+        low_min = df['Low'].rolling(k_period).min()
+        high_max = df['High'].rolling(k_period).max()
+        k = 100 * (df['Close'] - low_min) / (high_max - low_min)
+        d = k.rolling(d_period).mean()
+        return k, d
+
+    @staticmethod
+    def ADX(df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Average Directional Index."""
+        df = df.copy()
+        df['TR'] = np.maximum.reduce([df['High'] - df['Low'],
+                                      abs(df['High'] - df['Close'].shift()),
+                                      abs(df['Low'] - df['Close'].shift())])
+        df['+DM'] = np.where((df['High'] - df['High'].shift()) > (df['Low'].shift() - df['Low']),
+                             np.maximum(df['High'] - df['High'].shift(), 0), 0)
+        df['-DM'] = np.where((df['Low'].shift() - df['Low']) > (df['High'] - df['High'].shift()),
+                             np.maximum(df['Low'].shift() - df['Low'], 0), 0)
+        tr14 = df['TR'].rolling(period).sum()
+        plus_dm14 = df['+DM'].rolling(period).sum()
+        minus_dm14 = df['-DM'].rolling(period).sum()
+        plus_di = 100 * (plus_dm14 / tr14)
+        minus_di = 100 * (minus_dm14 / tr14)
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-6)
+        return dx.rolling(period).mean()
+
+    @staticmethod
+    def CCI(df: pd.DataFrame, period: int = 20) -> pd.Series:
+        """Commodity Channel Index."""
+        tp = (df['High'] + df['Low'] + df['Close']) / 3
+        ma = tp.rolling(period).mean()
+        md = tp.rolling(period).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
+        return (tp - ma) / (0.015 * md)
+
+    @staticmethod
+    def ROC(series: pd.Series, period: int = 12) -> pd.Series:
+        """Rate of Change."""
+        return series.diff(period) / series.shift(period) * 100
+
+    @staticmethod
+    def Momentum(series: pd.Series, period: int = 10) -> pd.Series:
+        """Momentum indicator."""
+        return series.diff(period)
+
+    @staticmethod
+    def williams_r(df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Williams %R."""
+        high_max = df['High'].rolling(period).max()
+        low_min = df['Low'].rolling(period).min()
+        return -100 * (high_max - df['Close']) / (high_max - low_min)
+
+    @staticmethod
+    def chaikin_oscillator(df: pd.DataFrame, short_period: int = 3, long_period: int = 10) -> pd.Series:
+        """Chaikin Oscillator."""
+        ad = ((2 * df['Close'] - df['Low'] - df['High']) / (df['High'] - df['Low'])).fillna(0) * df['Volume']
+        mfm = ((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / (df['High'] - df['Low']).replace(0, np.nan)
+        adl = (mfm * df['Volume']).cumsum()
+        return adl.rolling(short_period).mean() - adl.rolling(long_period).mean()
+
+    @staticmethod
+    def OBV(df: pd.DataFrame) -> pd.Series:
+        """On Balance Volume."""
+        direction = np.where(df['Close'].diff() >= 0, 1, -1)
+        return (direction * df['Volume']).cumsum()
+
+class OptionPricing:
+    """
+    Option pricing models.
+    """
+    @staticmethod
+    def black_scholes(S: float, K: float, T: float, r: float, sigma: float, option_type: str = 'call') -> float:
+        """
+        Compute the Black-Scholes price for an option.
+        """
+        d1 = (math.log(S / K) + (r + sigma**2 / 2) * T) / (sigma * math.sqrt(T))
+        d2 = d1 - sigma * math.sqrt(T)
+        N = lambda x: 0.5 * (1 + math.erf(x / math.sqrt(2)))
+        if option_type.lower() == 'call':
+            return S * N(d1) - K * math.exp(-r * T) * N(d2)
+        else:
+            return K * math.exp(-r * T) * N(-d2)
+
+    @staticmethod
+    def binomial(S: float, K: float, T: float, r: float, sigma: float, N: int = 100, option_type: str = 'call') -> float:
+        """
+        Price an option using the binomial method.
+        """
+        dt = T / N
+        u = math.exp(sigma * math.sqrt(dt))
+        d = 1 / u
+        p = (math.exp(r * dt) - d) / (u - d)
+        asset_prices = np.array([S * (u**j) * (d**(N - j)) for j in range(N + 1)])
+        if option_type.lower() == 'call':
+            option_values = np.maximum(asset_prices - K, 0)
+        else:
+            option_values = np.maximum(K - asset_prices, 0)
+        for i in range(N, 0, -1):
+            option_values = math.exp(-r * dt) * (p * option_values[1:i + 1] + (1 - p) * option_values[0:i])
+        return option_values[0]
+
+    @staticmethod
+    def monte_carlo(S: float, K: float, T: float, r: float, sigma: float, simulations: int = 10000, option_type: str = 'call') -> float:
+        """
+        Price an option using Monte Carlo simulation.
+        """
+        dt = T
+        rand = np.random.standard_normal(simulations)
+        ST = S * np.exp((r - 0.5 * sigma**2) * dt + sigma * math.sqrt(dt) * rand)
+        if option_type.lower() == 'call':
+            payoffs = np.maximum(ST - K, 0)
+        else:
+            payoffs = np.maximum(K - ST, 0)
+        return math.exp(-r * T) * np.mean(payoffs)
+
+    @staticmethod
+    def jump_diffusion(S: float, K: float, T: float, r: float, sigma: float, lam: float = 0.1, muJ: float = 0, sigmaJ: float = 0.1, option_type: str = 'call') -> float:
+        """
+        Price an option under the jump diffusion model.
+        """
+        price = 0.0
+        for k in range(50):
+            poisson_prob = math.exp(-lam * T) * (lam * T) ** k / math.factorial(k)
+            sigma_k = math.sqrt(sigma**2 + k * (sigmaJ**2) / T)
+            price += poisson_prob * OptionPricing.black_scholes(S, K, T, r, sigma_k, option_type)
+        return price
+
+# -----------------------------
+# Greeks & Risk Metrics
+# -----------------------------
+def calculate_option_greeks(S: float, K: float, T: float, r: float, sigma: float) -> Tuple[float, float, float, float]:
+    """
+    Calculate option Greeks: delta, gamma, theta, and vega.
+    """
+    d1 = (math.log(S / K) + (r + sigma**2 / 2) * T) / (sigma * math.sqrt(T))
+    delta = 0.5 * (1 + math.erf(d1 / math.sqrt(2)))
+    gamma = math.exp(-d1**2 / 2) / (S * sigma * math.sqrt(2 * math.pi * T))
+    theta = -(S * sigma * math.exp(-d1**2 / 2)) / (2 * math.sqrt(2 * math.pi * T)) - r * K * math.exp(-r * T) * 0.5 * (1 + math.erf((d1 - sigma * math.sqrt(T)) / math.sqrt(2)))
+    vega = S * math.sqrt(T) * math.exp(-d1**2 / 2) / math.sqrt(2 * math.pi)
+    return delta, gamma, theta, vega
+
+def risk_adjusted_metrics(returns: np.ndarray, rf: float = 0.01) -> Dict[str, float]:
+    """
+    Compute Sharpe, Sortino, Treynor, and Calmar ratios from returns.
+    """
+    std = np.std(returns)
+    sharpe = np.mean(returns - rf) / (std + 1e-6) if std > 0 else 0.0
+    downside = np.std([r for r in returns if r < rf])
+    sortino = np.mean(returns - rf) / (downside + 1e-6) if downside > 0 else 0.0
+    beta = 1.0  # Placeholder: implement beta calculation against a benchmark if available.
+    treynor = np.mean(returns - rf) / (beta + 1e-6)
+    max_drawdown = np.max(np.maximum.accumulate(returns) - returns)
+    calmar = np.mean(returns - rf) / (max_drawdown + 1e-6)
+    return {"Sharpe": sharpe, "Sortino": sortino, "Treynor": treynor, "Calmar": calmar}
+
+# -----------------------------
+# Feature Extraction, Augmentation, and PCA
+# -----------------------------
+def extract_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Extract and compute technical features.
+    """
+    features = pd.DataFrame(index=df.index)
+    features["Close"] = df["Close"]
+    features["WMA"] = TechnicalIndicators.WMA(df["Close"], 20)
+    features["DEMA"] = TechnicalIndicators.DEMA(df["Close"], 20)
+    features["TEMA"] = TechnicalIndicators.TEMA(df["Close"], 20)
+    features["SSMA"] = TechnicalIndicators.SSMA(df["Close"], 20)
+    features["VWMA"] = TechnicalIndicators.VWMA(df["Close"], df["Volume"], 20)
+    features["HMA"] = TechnicalIndicators.HMA(df["Close"], 20)
+    features["KAMA"] = TechnicalIndicators.KAMA(df["Close"], 20)
+    features["ALMA"] = TechnicalIndicators.ALMA(df["Close"], 20)
+    features["GMA"] = TechnicalIndicators.GMA(df["Close"], 20)
+    macd_line, _, _ = TechnicalIndicators.MACD(df["Close"])
+    features["MACD"] = macd_line
+    features["VWAP"] = TechnicalIndicators.VWAP(df)
+    k, _ = TechnicalIndicators.stochastic_oscillator(df)
+    features["Stochastic_K"] = k
+    features["ADX"] = TechnicalIndicators.ADX(df)
+    features["CCI"] = TechnicalIndicators.CCI(df)
+    features["ROC"] = TechnicalIndicators.ROC(df["Close"])
+    features["Momentum"] = TechnicalIndicators.Momentum(df["Close"])
+    features["WilliamsR"] = TechnicalIndicators.williams_r(df)
+    features["Chaikin"] = TechnicalIndicators.chaikin_oscillator(df)
+    features["OBV"] = TechnicalIndicators.OBV(df)
+    features = features.fillna(method="bfill").fillna(method="ffill")
+    return features
+
+def augment_features(features: pd.DataFrame) -> pd.DataFrame:
+    """
+    Augment features by adding small Gaussian noise.
+    """
+    augmented = features.copy()
+    noise = np.random.normal(0, 0.001, size=features.shape)
+    augmented += noise
+    return augmented
+
+def pca_reduce(features: pd.DataFrame, n_components: int = 10) -> pd.DataFrame:
+    """
+    Reduce dimensionality using SVD.
+    """
+    X = features.values
+    U, s, Vt = svd(X - np.mean(X, axis=0), full_matrices=False)
+    X_reduced = U[:, :n_components] * s[:n_components]
+    return pd.DataFrame(X_reduced, index=features.index)
+
+# -----------------------------
+# Neural Network with Advanced Autodiff using JAX
+# -----------------------------
+class NeuralNetworkJAX:
+    """
+    A configurable neural network built with JAX.
+    """
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_layers: Optional[List[int]] = None,
+        activation: str = "sin",
+        learning_rate: float = 1e-3,
+        dropout_rate: float = 0.0,
+        regularization: float = 0.0,
+        version: str = "v1.0"
+    ) -> None:
+        """
+        Initialize the neural network with configurable architecture.
+        """
+        if hidden_layers is None:
+            hidden_layers = [128, 128]
+        self.hidden_layers: List[int] = hidden_layers
+        self.activation_name: str = activation
+        self.learning_rate: float = learning_rate
+        self.dropout_rate: float = dropout_rate  # Not fully implemented; placeholder for future extension.
+        self.regularization: float = regularization
+        self.version: str = version
+        self.loss_history: List[float] = []
+        # Map activation name to function; can be extended
+        self.activation_fn: Callable[[jnp.ndarray], jnp.ndarray] = {
+            "sin": jnp.sin,
+            "relu": jax.nn.relu,
+            "tanh": jnp.tanh
+        }.get(activation, jnp.sin)
+        # Initialize parameters for each layer
+        layers = [input_dim] + hidden_layers + [output_dim]
+        self.params: Dict[str, jnp.ndarray] = {}
+        for i in range(len(layers) - 1):
+            self.params[f"W{i+1}"] = jnp.array(np.random.randn(layers[i], layers[i+1]) * 0.1)
+            self.params[f"b{i+1}"] = jnp.array(np.zeros(layers[i+1]))
+
+    def forward(self, X: jnp.ndarray, params: Optional[Dict[str, jnp.ndarray]] = None) -> jnp.ndarray:
+        """
+        Forward pass of the network.
+        """
+        if params is None:
+            params = self.params
+        a = X
+        num_layers = len(self.hidden_layers) + 1
+        for i in range(1, num_layers + 1):
+            z = jnp.dot(a, params[f"W{i}"]) + params[f"b{i}"]
+            if i < num_layers:
+                a = self.activation_fn(z)
+            else:
+                a = z  # output layer
+        return a
+
+    def loss(self, params: Dict[str, jnp.ndarray], X: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
+        """
+        Compute mean squared error loss with optional L2 regularization.
+        """
+        pred = self.forward(X, params)
+        mse = jnp.mean((pred - y) ** 2)
+        l2_reg = sum(jnp.sum(jnp.square(p)) for p in params.values())
+        return mse + self.regularization * l2_reg
+
+    @profile
+    def train(self, X: np.ndarray, y: np.ndarray, epochs: int = 100, early_stopping: int = 10) -> List[float]:
+        """
+        Train the neural network with JAX.
+        """
+        X_jax = jnp.array(X)
+        y_jax = jnp.array(y)
+        loss_grad = grad(self.loss)
+        best_loss = float("inf")
+        early_stop_counter = 0
+        params = self.params
+
+        @jit
+        def update_params(params, X_jax, y_jax):
+            l = self.loss(params, X_jax, y_jax)
+            grads = loss_grad(params, X_jax, y_jax)
+            new_params = {k: params[k] - self.learning_rate * grads[k] for k in params}
+            return new_params, l
+
+        for epoch in range(epochs):
+            params, l = update_params(params, X_jax, y_jax)
+            self.loss_history.append(float(l))
+            if l < best_loss:
+                best_loss = l
+                early_stop_counter = 0
+            else:
+                early_stop_counter += 1
+                if early_stop_counter >= early_stopping:
+                    logger.info(f"[JAX] Early stopping triggered at epoch {epoch+1}.")
+                    break
+        self.params = params
+        # Save loss curve plot
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(6, 4))
+        plt.plot(self.loss_history, label="JAX Training Loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Neural Network (JAX) Training Loss")
+        plt.legend()
+        plt.savefig("loss_curve_jax.png")
+        plt.close()
+        return self.loss_history
+
+    def predict(self, X: np.ndarray) -> jnp.ndarray:
+        """
+        Predict outputs for given inputs.
+        """
+        X_jax = jnp.array(X)
+        return self.forward(X_jax)
+
+# -----------------------------
+# Heston Simulation using JAX & lax.fori_loop
+# -----------------------------
+@partial(jit, static_argnames=['N', 'M'])
+def heston_model_sim_jax(S0: float, v0: float, rho: float, kappa: float, theta: float, sigma: float, r: float,
+                         T: float, N: int, M: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Simulate stock paths under the Heston model using JAX.
+    Uses lax.fori_loop to iterate over time steps.
+    """
+    dt = T / N
+    mu = jnp.array([0.0, 0.0])
+    cov = jnp.array([[1.0, rho], [rho, 1.0]])
+    S = jnp.full((N+1, M), S0)
+    v = jnp.full((N+1, M), v0)
+    key = random.PRNGKey(0)
+    Z = random.multivariate_normal(key, mean=mu, cov=cov, shape=(N, M))
+    
+    def body(i, carry):
+        S, v = carry
+        S_prev = S[i-1]
+        v_prev = v[i-1]
+        dS = (r - 0.5 * v_prev) * dt + jnp.sqrt(v_prev * dt) * Z[i-1, :, 0]
+        new_S = S_prev * jnp.exp(dS)
+        dv = kappa * (theta - v_prev) * dt + sigma * jnp.sqrt(v_prev * dt) * Z[i-1, :, 1]
+        new_v = jnp.maximum(v_prev + dv, 0.0)
+        S = S.at[i].set(new_S)
+        v = v.at[i].set(new_v)
+        return (S, v)
+
+    S, v = lax.fori_loop(1, N+1, body, (S, v))
+    return S, v
+
+# -----------------------------
+# Dashboard for Real-Time Monitoring using Dash
+# -----------------------------
+def start_dashboard(metrics_data: Dict[str, Any]) -> None:
+    """
+    Start a live dashboard to monitor performance metrics.
+    """
+    app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+    app.layout = dbc.Container([
+        dbc.Row([dbc.Col(html.H2("Live Performance Dashboard"), width=12)]),
+        dbc.Row([
+            dbc.Col(dbc.Card([
+                dbc.CardHeader("Average Black–Scholes Price"),
+                dbc.CardBody(html.H4(id="avg-bs", children=str(metrics_data.get("avg_bs", "N/A"))))
+            ]), width=6),
+            dbc.Col(dbc.Card([
+                dbc.CardHeader("Average Sentiment"),
+                dbc.CardBody(html.H4(id="avg-sent", children=str(metrics_data.get("avg_sent", "N/A"))))
+            ]), width=6)
+        ]),
+        dcc.Interval(id="interval", interval=10*1000, n_intervals=0)
+    ], fluid=True)
+
+    @app.callback(
+        [Output("avg-bs", "children"), Output("avg-sent", "children")],
+        [Input("interval", "n_intervals")]
+    )
+    def update_metrics(n):
+        return (str(metrics_data.get("avg_bs", "N/A")), str(metrics_data.get("avg_sent", "N/A")))
+    threading.Thread(target=app.run_server, kwargs={'port':8050}, daemon=True).start()
+    logger.info("Dashboard started at http://127.0.0.1:8050")
+
+# -----------------------------
+# Walk Forward Optimization
+# -----------------------------
+def advanced_bayesian_optimization_lr(X_train: np.ndarray, y_train: np.ndarray, n_iter: int = 25) -> Tuple[float, Any]:
+    """
+    Tune learning rate using Bayesian optimization.
+    """
+    def objective_lr(lr: float) -> float:
+        nn = NeuralNetworkJAX(input_dim=X_train.shape[1], output_dim=1, learning_rate=lr)
+        loss_history = nn.train(X_train, y_train, epochs=10, early_stopping=3)
+        return -loss_history[-1]
+    optimizer = BayesianOptimization(
+        f=objective_lr,
+        pbounds={'lr': (1e-5, 1e-1)},
+        random_state=42,
+        verbose=0
+    )
+    optimizer.maximize(init_points=5, n_iter=n_iter)
+    best_lr = optimizer.max['params']['lr']
+    logger.info(f"Advanced Bayesian Optimization selected learning_rate = {best_lr}")
+    return best_lr, optimizer
+
+def walk_forward_optimization(features: pd.DataFrame, targets: pd.Series, window: int = 100) -> List[Tuple[Any, float]]:
+    """
+    Walk-forward optimization to produce predictions.
+    """
+    predictions: List[Tuple[Any, float]] = []
+    for start in range(0, len(features) - window, window):
+        X_train = features.iloc[start:start + window].values
+        y_train = targets.iloc[start:start + window].values.reshape(-1, 1)
+        best_lr, _ = advanced_bayesian_optimization_lr(X_train, y_train, n_iter=5)
+        nn_jax = NeuralNetworkJAX(input_dim=X_train.shape[1], output_dim=1, learning_rate=best_lr)
+        nn_jax.train(X_train, y_train, epochs=50, early_stopping=5)
+        X_pred = features.iloc[start + window:start + window + 1].values
+        pred = nn_jax.predict(X_pred)
+        predictions.append((features.index[start + window], float(pred[0])))
+    return predictions
+
+# -----------------------------
+# Process a Single Ticker
+# -----------------------------
+def process_ticker(ticker: str) -> Optional[Dict[str, Any]]:
+    """
+    Process a ticker symbol: fetch data, compute features, predictions, option prices, sentiment and risk metrics.
+    """
+    try:
+        # Use asynchronous fetch for stock data.
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        df = loop.run_until_complete(DataFetcher().async_fetch_stock_data(ticker))
+        target = df["Close"].shift(-4) / df["Close"] - 1
+        target = target.fillna(0)
+        features = extract_features(df)
+        augmented = augment_features(features)
+        reduced = pca_reduce(augmented, n_components=10)
+        predictions = walk_forward_optimization(reduced, target)
+        latest_close = df["Close"].iloc[-1]
+        strike = latest_close
+        r = 0.01
+        T = 4 / 252  # 4 trading days ahead (in years)
+        sigma = np.std(np.log(df["Close"] / df["Close"].shift(1)).dropna()) * math.sqrt(252)
+        bs_price = OptionPricing.black_scholes(latest_close, strike, T, r, sigma, option_type="call")
+        binom_price = OptionPricing.binomial(latest_close, strike, T, r, sigma, N=100, option_type="call")
+        mc_price = OptionPricing.monte_carlo(latest_close, strike, T, r, sigma, simulations=10000, option_type="call")
+        delta, gamma, theta, vega = calculate_option_greeks(latest_close, strike, T, r, sigma)
+        sentiment = loop.run_until_complete(DataFetcher().fetch_news_sentiment(ticker))
+        returns = np.log(df["Close"] / df["Close"].shift(1)).dropna().values
+        # Fit HMM in parallel
+        hmm = HiddenMarkovModel(n_states=2)
+        hmm.fit(returns, n_iter=10, parallel=True, n_init=4)
+        regimes = hmm.predict(returns)
+        regime = regimes[-1]
+        risk_metrics = {"RiskMetrics": risk_adjusted_metrics(returns)}
+        result = {
+            "Ticker": ticker,
+            "LatestClose": latest_close,
+            "Strike": strike,
+            "BS_Price": bs_price,
+            "Binom_Price": binom_price,
+            "MC_Price": mc_price,
+            "Delta": delta,
+            "Gamma": gamma,
+            "Theta": theta,
+            "Vega": vega,
+            "Sentiment": sentiment,
+            "CurrentRegime": regime,
+            "RiskMetrics": risk_metrics,
+            "Predictions": predictions
+        }
+        return result
+    except Exception as e:
+        logger.error(f"Error processing ticker {ticker}: {e}")
+        return None
+
+def parallel_ticker_processing(tickers: List[str]) -> List[Dict[str, Any]]:
+    """
+    Process multiple tickers in parallel.
+    """
+    with mp.Pool(processes=min(len(tickers), mp.cpu_count())) as pool:
+        results = pool.map(process_ticker, tickers)
+    return [res for res in results if res is not None]
+
+# -----------------------------
+# GPU Test Routine
+# -----------------------------
+def gpu_vector_test() -> Optional[np.ndarray]:
+    """
+    Test GPU acceleration against CPU routine.
+    """
+    try:
+        gpu_accel = GPUAccelerator()
+        a = np.random.rand(1000000)
+        b = np.random.rand(1000000)
+        result = gpu_accel.vector_multiply(a, b)
+        cpu_result = np.empty(1)
+        cpu_result[0] = fast_cpu_distance(a, b)
+        logger.info("GPU vector multiply test completed.")
+        return result
+    except Exception as e:
+        logger.error(f"GPU test failed: {e}")
+        return None
+
+# -----------------------------
+# Build Prediction Table & Plot Performance Metrics
+# -----------------------------
+def build_prediction_table(results: List[Dict[str, Any]]) -> Optional[pd.DataFrame]:
+    """
+    Build a prediction table from processed results.
+    """
+    rows: List[Dict[str, Any]] = []
+    for res in results:
+        if res.get("Predictions"):
+            pred_date, pred_change = res["Predictions"][-1]
+            if pred_change >= 10.0:
+                rows.append({
+                    "Date": pred_date.strftime("%Y-%m-%d") if isinstance(pred_date, datetime.datetime) else str(pred_date),
+                    "Ticker": res["Ticker"],
+                    "Strike": res["Strike"],
+                    "Predicted Increase (%)": pred_change * 100,
+                    "BS Price": res["BS_Price"],
+                    "Sentiment": res["Sentiment"]
+                })
+    return pd.DataFrame(rows) if rows else None
+
+def plot_performance_metrics(results: List[Dict[str, Any]]) -> None:
+    """
+    Plot performance metrics from the results.
+    """
+    tickers = [res["Ticker"] for res in results if res is not None]
+    sentiments = [res["Sentiment"] for res in results if res is not None]
+    bs_prices = [res["BS_Price"] for res in results if res is not None]
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(8, 6))
+    plt.scatter(sentiments, bs_prices, c="blue")
+    plt.xlabel("News Sentiment")
+    plt.ylabel("Black–Scholes Price")
+    plt.title("Performance Metrics per Ticker")
+    plt.grid(True)
+    plt.savefig("performance_metrics.png")
+    plt.show()
+
+# -----------------------------
+# Main Execution Function
+# -----------------------------
+def main() -> None:
+    """
+    Main entry point for processing ticker symbols and launching the dashboard.
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test", action="store_true", help="Run unit tests and exit")
+    args = parser.parse_args()
+    if args.test:
+        run_tests()
+        return
+    now = datetime.datetime.now()
+    if now.weekday() != RUN_DAY or now.hour < RUN_HOUR:
+        logger.error("This script is designed to run at Monday close (after 16:00). Exiting.")
+        sys.exit(1)
+    try:
+        tickers_input = input("Enter tickers (comma separated): ")
+        tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+        if not tickers:
+            logger.error("No tickers provided. Exiting.")
+            sys.exit(1)
+    except Exception as e:
+        logger.error(f"Input error: {e}")
+        sys.exit(1)
+    try:
+        gpu_vector_test()
+    except Exception as e:
+        logger.error(f"GPU acceleration test failed: {e}")
+    results = parallel_ticker_processing(tickers)
+    if not results:
+        logger.info("No predictions generated due to data or market conditions.")
+        return
+    prediction_table = build_prediction_table(results)
+    if prediction_table is not None and not prediction_table.empty:
+        print("\nPrediction Table:")
+        print(prediction_table.to_string(index=False))
+    else:
+        print("No call option price increase predictions meeting the threshold were found.")
+    plot_performance_metrics(results)
+    avg_bs = np.mean([res["BS_Price"] for res in results if "BS_Price" in res])
+    avg_sent = np.mean([res["Sentiment"] for res in results if "Sentiment" in res])
+    metrics_data = {"avg_bs": avg_bs, "avg_sent": avg_sent}
+    start_dashboard(metrics_data)
+    logger.info("Processing complete. Dashboard is live; press Ctrl+C to exit.")
+    try:
+        while True:
+            time.sleep(10)
+    except KeyboardInterrupt:
+        sys.exit(0)
+
+# -----------------------------
+# Unit and Integration Tests Using Pytest
+# -----------------------------
+def run_tests() -> None:
+    """
+    Run unit tests and integration tests for the entire pipeline.
+    """
+    import matplotlib.pyplot as plt
+    logger.info("Running unit tests...")
+    # Test CPU kernel using Numba
+    a = np.array([1.0, 2.0, 3.0])
+    b = np.array([1.0, 2.0, 3.0])
+    cpu_result = fast_cpu_distance(a, b)
+    assert abs(cpu_result) < 1e-6, "CPU kernel (Numba) test failed."
+    
+    # Test GPU accelerator
+    gpu = GPUAccelerator()
+    res_gpu = gpu.vector_multiply(a, b)
+    assert np.allclose(res_gpu, a * b), "GPU routine test failed."
+    
+    # Test NeuralNetworkJAX forward and gradient
+    X_test = np.random.rand(5, 10)
+    y_test = np.random.rand(5, 1)
+    nn_jax = NeuralNetworkJAX(input_dim=10, output_dim=1)
+    l_val = nn_jax.loss(nn_jax.params, jnp.array(X_test), jnp.array(y_test))
+    g = grad(nn_jax.loss)(nn_jax.params, jnp.array(X_test), jnp.array(y_test))
+    for key in nn_jax.params:
+        assert key in g, f"Missing gradient for {key}"
+    
+    # Test SentimentTransformer
+    st = SentimentTransformer()
+    score = st.analyze("This is a great day for trading!")
+    assert isinstance(score, float), "Sentiment transformer test failed."
+    
+    # Test Feature Extraction
+    df_sample = pd.DataFrame({
+        "Close": np.linspace(100, 110, 30),
+        "Volume": np.random.randint(1000, 5000, 30),
+        "High": np.linspace(101, 111, 30),
+        "Low": np.linspace(99, 109, 30)
+    }, index=pd.date_range("2020-01-01", periods=30))
+    feats = extract_features(df_sample)
+    assert not feats.empty, "Feature extraction test failed."
+    
+    # Test retry decorator with edge case
+    call_counter = {"count": 0}
+    @retry(Exception, tries=3, delay=0.1, backoff=1)
+    def test_retry_success():
+        call_counter["count"] += 1
+        if call_counter["count"] < 3:
+            raise ValueError("Failing")
+        return "succeeded"
+    assert test_retry_success() == "succeeded", "Retry decorator test failed."
+    
+    # Test profiling decorator
+    @profile
+    def dummy_sleep():
+        time.sleep(0.2)
+        return "done"
+    result = dummy_sleep()
+    assert result == "done", "Profiling decorator test failed."
+    
+    # Integration test: process a sample ticker (using a known ticker or mocked data)
+    sample_ticker = "AAPL"
+    result = process_ticker(sample_ticker)
+    assert result is not None, "Integration test for process_ticker failed."
+    
+    logger.info("All unit and integration tests passed.")
+
+if __name__ == "__main__":
+    main()
