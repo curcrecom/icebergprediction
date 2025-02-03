@@ -201,9 +201,6 @@ def fast_cpu_distance(x: np.ndarray, y: np.ndarray) -> float:
 class GPUAccelerator:
     """
     GPU accelerator that distributes workload across discrete and integrated GPUs.
-
-    It creates separate contexts and command queues for each target device (e.g. AMD Radeon Pro 5300M and
-    Intel UHD Graphics 630) and batches computations between them.
     """
     def __init__(self) -> None:
         self.devices: List[cl.Device] = []
@@ -220,13 +217,17 @@ class GPUAccelerator:
                     if "amd" in vendor and "radeon pro 5300m" in dev.name.lower():
                         self.devices.append(dev)
                         self.contexts["dGPU"] = cl.Context(devices=[dev])
-                        self.queues["dGPU"] = cl.CommandQueue(self.contexts["dGPU"],
-                                                              properties=cl.command_queue_properties.OUT_OF_ORDER_EXEC_MODE_ENABLE)
+                        self.queues["dGPU"] = cl.CommandQueue(
+                            self.contexts["dGPU"],
+                            properties=cl.command_queue_properties.OUT_OF_ORDER_EXEC_MODE_ENABLE
+                        )
                     elif "intel" in vendor and "uhd graphics" in dev.name.lower():
                         self.devices.append(dev)
                         self.contexts["iGPU"] = cl.Context(devices=[dev])
-                        self.queues["iGPU"] = cl.CommandQueue(self.contexts["iGPU"],
-                                                              properties=cl.command_queue_properties.OUT_OF_ORDER_EXEC_MODE_ENABLE)
+                        self.queues["iGPU"] = cl.CommandQueue(
+                            self.contexts["iGPU"],
+                            properties=cl.command_queue_properties.OUT_OF_ORDER_EXEC_MODE_ENABLE
+                        )
             if not self.devices:
                 raise GPUInitializationError("Required GPUs (dGPU or iGPU) not found.")
             logger.info(f"GPU Accelerator initialized with devices: {[dev.name for dev in self.devices]}")
@@ -234,7 +235,7 @@ class GPUAccelerator:
             logger.error(f"Failed to initialize GPU accelerator: {e}")
             raise GPUInitializationError(e)
 
-        # Define kernel code for vector multiplication.
+        # Define kernel code for element-wise vector multiplication.
         self.kernel_code: str = """
         __kernel void vec_mult(__global const double* a,
                                __global const double* b,
@@ -366,14 +367,13 @@ class DataFetcher:
         Asynchronously fetch stock data for a ticker using yfinance with caching.
         Note: yfinance itself is synchronous; we offload it to a thread.
         """
-        loop = asyncio.get_event_loop()
         if ticker in self.cache:
             logger.info(f"Loading cached data for ticker: {ticker}")
             df = pd.read_json(self.cache[ticker], convert_dates=True)
         else:
             logger.info(f"Fetching data from yfinance for ticker: {ticker}")
             try:
-                df = await loop.run_in_executor(None, lambda: yf.Ticker(ticker).history(period=period))
+                df = await asyncio.to_thread(lambda: yf.Ticker(ticker).history(period=period))
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = ['_'.join(col).strip() for col in df.columns.values]
                 self.cache[ticker] = df.to_json(date_format='iso')
@@ -414,7 +414,32 @@ class DataFetcher:
         return np.mean(sentiment_scores) if sentiment_scores else 0.0
 
 # -----------------------------
-# Beta Calculation Helper
+# Option Greeks Calculation
+# -----------------------------
+def calculate_option_greeks(S: float, K: float, T: float, r: float, sigma: float, option_type: str = 'call') -> Tuple[float, float, float, float]:
+    """
+    Calculate Delta, Gamma, Theta, and Vega using Black–Scholes formulas.
+    """
+    d1 = (math.log(S / K) + (r + sigma**2 / 2) * T) / (sigma * math.sqrt(T) + 1e-12)
+    d2 = d1 - sigma * math.sqrt(T)
+    # Cumulative distribution function for standard normal distribution
+    N = lambda x: 0.5 * (1 + math.erf(x / math.sqrt(2)))
+    # Probability density function for standard normal distribution
+    n = lambda x: math.exp(-0.5 * x**2) / math.sqrt(2 * math.pi)
+    if option_type.lower() == "call":
+        delta = N(d1)
+        theta = (-S * n(d1) * sigma / (2 * math.sqrt(T)) 
+                 - r * K * math.exp(-r * T) * N(d2))
+    else:
+        delta = N(d1) - 1
+        theta = (-S * n(d1) * sigma / (2 * math.sqrt(T)) 
+                 + r * K * math.exp(-r * T) * N(-d2))
+    gamma = n(d1) / (S * sigma * math.sqrt(T) + 1e-12)
+    vega = S * math.sqrt(T) * n(d1)
+    return delta, gamma, theta, vega
+
+# -----------------------------
+# Benchmark and Risk Metrics
 # -----------------------------
 def get_benchmark_returns(benchmark_ticker: str = "^GSPC", start: Optional[str] = None, end: Optional[str] = None) -> np.ndarray:
     """
@@ -439,7 +464,7 @@ def risk_adjusted_metrics(returns: np.ndarray, benchmark: Optional[np.ndarray] =
     sharpe = np.mean(returns - rf) / (std + 1e-6) if std > 0 else 0.0
     downside = np.std([r for r in returns if r < rf])
     sortino = np.mean(returns - rf) / (downside + 1e-6) if downside > 0 else 0.0
-    
+
     if benchmark is not None and benchmark.size > 0:
         cov = np.cov(returns, benchmark)[0, 1]
         var_bench = np.var(benchmark)
@@ -564,7 +589,7 @@ class TechnicalIndicators:
         minus_dm14 = df['-DM'].rolling(period).sum()
         plus_di = 100 * (plus_dm14 / tr14)
         minus_di = 100 * (minus_dm14 / tr14)
-        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-6)
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-12)
         return dx.rolling(period).mean()
 
     @staticmethod
@@ -803,11 +828,6 @@ def fit_parallel_hmm(observations: np.ndarray, n_states: int, n_iter: int = 10, 
     best_model.pi = best_result['pi']
     logger.info(f"Best log likelihood from parallel HMM fits: {best_ll:.4f}")
     return best_model
-
-# -----------------------------
-# Technical Indicators & Option Pricing (continued)
-# -----------------------------
-# (The TechnicalIndicators and OptionPricing classes are defined above.)
 
 # -----------------------------
 # Feature Extraction, Augmentation, and PCA
@@ -1104,10 +1124,9 @@ def process_ticker(ticker: str) -> Optional[Dict[str, Any]]:
     Process a ticker symbol: fetch data, compute features, predictions, option prices, sentiment and risk metrics.
     """
     try:
-        # Use asynchronous fetch for stock data.
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        df = loop.run_until_complete(DataFetcher().async_fetch_stock_data(ticker))
+        # Use asyncio.run for asynchronous tasks
+        data_fetcher = DataFetcher()
+        df = asyncio.run(data_fetcher.async_fetch_stock_data(ticker))
         target = df["Close"].shift(-4) / df["Close"] - 1
         target = target.fillna(0)
         features = extract_features(df)
@@ -1123,7 +1142,7 @@ def process_ticker(ticker: str) -> Optional[Dict[str, Any]]:
         binom_price = OptionPricing.binomial(latest_close, strike, T, r, sigma, N=100, option_type="call")
         mc_price = OptionPricing.monte_carlo(latest_close, strike, T, r, sigma, simulations=10000, option_type="call")
         delta, gamma, theta, vega = calculate_option_greeks(latest_close, strike, T, r, sigma)
-        sentiment = loop.run_until_complete(DataFetcher().fetch_news_sentiment(ticker))
+        sentiment = asyncio.run(data_fetcher.fetch_news_sentiment(ticker))
         returns = np.log(df["Close"] / df["Close"].shift(1)).dropna().values
         # Fetch benchmark returns for beta calculation
         benchmark_returns = get_benchmark_returns(start=str(df.index[0].date()), end=str(df.index[-1].date()))
@@ -1174,9 +1193,10 @@ def gpu_vector_test() -> Optional[np.ndarray]:
         a = np.random.rand(1000000)
         b = np.random.rand(1000000)
         result = gpu_accel.vector_multiply(a, b)
-        cpu_result = np.empty(1)
-        cpu_result[0] = fast_cpu_distance(a, b)
-        logger.info("GPU vector multiply test completed.")
+        expected = a * b  # Element-wise multiplication
+        if not np.allclose(result, expected):
+            raise ValueError("GPU vector multiplication does not match expected result.")
+        logger.info("GPU vector multiply test completed successfully.")
         return result
     except Exception as e:
         logger.error(f"GPU test failed: {e}")
@@ -1288,10 +1308,11 @@ def run_tests() -> None:
     cpu_result = fast_cpu_distance(a, b)
     assert abs(cpu_result) < 1e-6, "CPU kernel (Numba) test failed."
     
-    # Test GPU accelerator
+    # Test GPU accelerator: compare element-wise multiplication
     gpu = GPUAccelerator()
     res_gpu = gpu.vector_multiply(a, b)
-    assert np.allclose(res_gpu, a * b), "GPU routine test failed."
+    expected = a * b
+    assert np.allclose(res_gpu, expected), "GPU routine test failed."
     
     # Test NeuralNetworkJAX forward and gradient with dropout
     X_test = np.random.rand(5, 10)
