@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import os
 import sys
 import time
@@ -202,7 +204,7 @@ class GPUAccelerator:
     """
     GPU accelerator that distributes workload across discrete and integrated GPUs.
 
-    It creates separate contexts and command queues for each target device (e.g., AMD Radeon Pro 5300M and
+    It creates separate contexts and command queues for each target device (e.g. AMD Radeon Pro 5300M and
     Intel UHD Graphics 630) and batches computations between them.
     """
     def __init__(self) -> None:
@@ -414,141 +416,42 @@ class DataFetcher:
         return np.mean(sentiment_scores) if sentiment_scores else 0.0
 
 # -----------------------------
-# Hidden Markov Model (HMM)
+# Beta Calculation Helper
 # -----------------------------
-class HiddenMarkovModel:
+def get_benchmark_returns(benchmark_ticker: str = "^GSPC", start: Optional[str] = None, end: Optional[str] = None) -> np.ndarray:
     """
-    Hidden Markov Model with EM fitting.
+    Fetch benchmark returns from yfinance.
     """
-    def __init__(self, n_states: int = 2, seed: Optional[int] = None) -> None:
-        self.n_states: int = n_states
-        if seed is not None:
-            np.random.seed(seed)
-        self.trans_mat: np.ndarray = np.full((n_states, n_states), 1.0 / n_states)
-        self.means: np.ndarray = np.random.randn(n_states)
-        self.vars: np.ndarray = np.ones(n_states)
-        self.pi: np.ndarray = np.full(n_states, 1.0 / n_states)
+    try:
+        benchmark = yf.Ticker(benchmark_ticker)
+        df_bench = benchmark.history(start=start, end=end)
+        df_bench = df_bench.dropna()
+        returns = np.log(df_bench["Close"] / df_bench["Close"].shift(1)).dropna().values
+        return returns
+    except Exception as e:
+        logger.error(f"Error fetching benchmark returns: {e}")
+        return np.array([])
 
-    def _emission_probs(self, observations: np.ndarray) -> np.ndarray:
-        """
-        Calculate the emission probabilities for the observations.
-        """
-        T: int = observations.shape[0]
-        obs = observations.reshape(-1, 1)
-        coef = 1.0 / np.sqrt(2 * math.pi * self.vars)
-        exponents = -((obs - self.means) ** 2) / (2 * self.vars)
-        return coef * np.exp(exponents)
-
-    @profile
-    def _fit_single(self, observations: np.ndarray, n_iter: int = 10) -> float:
-        """
-        Fit the HMM using the EM algorithm.
-        """
-        T: int = observations.shape[0]
-        log_likelihood: float = -np.inf
-        for iteration in range(n_iter):
-            E = self._emission_probs(observations)
-            alpha = np.zeros((T, self.n_states))
-            scale = np.zeros(T)
-            alpha[0] = self.pi * E[0]
-            scale[0] = alpha[0].sum()
-            alpha[0] /= (scale[0] + 1e-12)
-            for t in range(1, T):
-                alpha[t] = E[t] * np.dot(alpha[t - 1], self.trans_mat)
-                scale[t] = alpha[t].sum()
-                alpha[t] /= (scale[t] + 1e-12)
-            beta = np.zeros((T, self.n_states))
-            beta[T - 1] = np.ones(self.n_states) / (scale[T - 1] + 1e-12)
-            for t in range(T - 2, -1, -1):
-                beta[t] = np.dot(self.trans_mat, (E[t + 1] * beta[t + 1]))
-                beta[t] /= (scale[t] + 1e-12)
-            gamma = alpha * beta
-            gamma /= (gamma.sum(axis=1, keepdims=True) + 1e-12)
-            num = alpha[:-1, :, None] * self.trans_mat[None, :, :] * E[1:, None, :] * beta[1:, None, :]
-            denom = num.sum(axis=(1, 2), keepdims=True) + 1e-12
-            xi = num / denom
-            self.trans_mat = xi.sum(axis=0) / (xi.sum(axis=(0, 2), keepdims=True) + 1e-12)
-            self.trans_mat = self.trans_mat.squeeze()
-            gamma_sum = gamma.sum(axis=0)
-            self.means = (gamma * observations.reshape(-1, 1)).sum(axis=0) / (gamma_sum + 1e-12)
-            self.vars = (gamma * (observations.reshape(-1, 1) - self.means) ** 2).sum(axis=0) / (gamma_sum + 1e-12)
-            self.pi = gamma[0]
-            log_likelihood = np.sum(np.log(scale + 1e-12))
-            logger.debug(f"HMM Iteration {iteration+1}/{n_iter}, Log Likelihood: {log_likelihood:.4f}")
-        return log_likelihood
-
-    def fit(self, observations: np.ndarray, n_iter: int = 10, parallel: bool = False, n_init: int = 1) -> float:
-        """
-        Fit the HMM model.
-        """
-        if parallel and n_init > 1:
-            best_model = fit_parallel_hmm(observations, self.n_states, n_iter, n_init)
-            self.trans_mat = best_model.trans_mat
-            self.means = best_model.means
-            self.vars = best_model.vars
-            self.pi = best_model.pi
-            log_likelihood = np.sum(np.log(self._emission_probs(observations).sum(axis=1) + 1e-12))
-            logger.info(f"Selected best HMM from parallel fits with log likelihood: {log_likelihood:.4f}")
-            return log_likelihood
-        else:
-            return self._fit_single(observations, n_iter)
-
-    def predict(self, observations: np.ndarray) -> np.ndarray:
-        """
-        Predict the state sequence for the observations.
-        """
-        T: int = observations.shape[0]
-        N: int = self.n_states
-        E = self._emission_probs(observations)
-        delta = np.zeros((T, N))
-        psi = np.zeros((T, N), dtype=int)
-        delta[0] = np.log(self.pi + 1e-12) + np.log(E[0] + 1e-12)
-        for t in range(1, T):
-            for j in range(N):
-                temp = delta[t - 1] + np.log(self.trans_mat[:, j] + 1e-12)
-                psi[t, j] = np.argmax(temp)
-                delta[t, j] = np.max(temp) + np.log(E[t, j] + 1e-12)
-        states = np.zeros(T, dtype=int)
-        states[T - 1] = np.argmax(delta[T - 1])
-        for t in range(T - 2, -1, -1):
-            states[t] = psi[t + 1, states[t + 1]]
-        return states
-
-def _fit_instance_hmm(observations: np.ndarray, n_states: int, n_iter: int, seed: int) -> dict:
+def risk_adjusted_metrics(returns: np.ndarray, benchmark: Optional[np.ndarray] = None, rf: float = 0.01) -> Dict[str, float]:
     """
-    Helper to fit a single HMM instance for parallel processing.
+    Compute Sharpe, Sortino, Treynor, and Calmar ratios from returns.
+    Fully implements beta calculation if benchmark returns are provided.
     """
-    model = HiddenMarkovModel(n_states=n_states, seed=seed)
-    ll = model._fit_single(observations, n_iter)
-    return {
-        'log_likelihood': ll,
-        'trans_mat': model.trans_mat,
-        'means': model.means,
-        'vars': model.vars,
-        'pi': model.pi
-    }
-
-def fit_parallel_hmm(observations: np.ndarray, n_states: int, n_iter: int = 10, n_init: int = 4) -> HiddenMarkovModel:
-    """
-    Fit HMM in parallel and select the best model.
-    """
-    best_result = None
-    best_ll = -np.inf
-    with concurrent.futures.ProcessPoolExecutor() as executor:
-        futures = [executor.submit(_fit_instance_hmm, observations, n_states, n_iter, seed)
-                   for seed in range(n_init)]
-        for future in concurrent.futures.as_completed(futures):
-            res = future.result()
-            if res['log_likelihood'] > best_ll:
-                best_ll = res['log_likelihood']
-                best_result = res
-    best_model = HiddenMarkovModel(n_states=n_states)
-    best_model.trans_mat = best_result['trans_mat']
-    best_model.means = best_result['means']
-    best_model.vars = best_result['vars']
-    best_model.pi = best_result['pi']
-    logger.info(f"Best log likelihood from parallel HMM fits: {best_ll:.4f}")
-    return best_model
+    std = np.std(returns)
+    sharpe = np.mean(returns - rf) / (std + 1e-6) if std > 0 else 0.0
+    downside = np.std([r for r in returns if r < rf])
+    sortino = np.mean(returns - rf) / (downside + 1e-6) if downside > 0 else 0.0
+    
+    if benchmark is not None and benchmark.size > 0:
+        cov = np.cov(returns, benchmark)[0, 1]
+        var_bench = np.var(benchmark)
+        beta = cov / (var_bench + 1e-6)
+    else:
+        beta = 1.0
+    treynor = np.mean(returns - rf) / (beta + 1e-6)
+    max_drawdown = np.max(np.maximum.accumulate(returns) - returns)
+    calmar = np.mean(returns - rf) / (max_drawdown + 1e-6)
+    return {"Sharpe": sharpe, "Sortino": sortino, "Treynor": treynor, "Calmar": calmar, "Beta": beta}
 
 # -----------------------------
 # Technical Indicators & Option Pricing
@@ -767,32 +670,146 @@ class OptionPricing:
         return price
 
 # -----------------------------
-# Greeks & Risk Metrics
+# Hidden Markov Model (HMM)
 # -----------------------------
-def calculate_option_greeks(S: float, K: float, T: float, r: float, sigma: float) -> Tuple[float, float, float, float]:
+class HiddenMarkovModel:
     """
-    Calculate option Greeks: delta, gamma, theta, and vega.
+    Hidden Markov Model with EM fitting.
     """
-    d1 = (math.log(S / K) + (r + sigma**2 / 2) * T) / (sigma * math.sqrt(T))
-    delta = 0.5 * (1 + math.erf(d1 / math.sqrt(2)))
-    gamma = math.exp(-d1**2 / 2) / (S * sigma * math.sqrt(2 * math.pi * T))
-    theta = -(S * sigma * math.exp(-d1**2 / 2)) / (2 * math.sqrt(2 * math.pi * T)) - r * K * math.exp(-r * T) * 0.5 * (1 + math.erf((d1 - sigma * math.sqrt(T)) / math.sqrt(2)))
-    vega = S * math.sqrt(T) * math.exp(-d1**2 / 2) / math.sqrt(2 * math.pi)
-    return delta, gamma, theta, vega
+    def __init__(self, n_states: int = 2, seed: Optional[int] = None) -> None:
+        self.n_states: int = n_states
+        if seed is not None:
+            np.random.seed(seed)
+        self.trans_mat: np.ndarray = np.full((n_states, n_states), 1.0 / n_states)
+        self.means: np.ndarray = np.random.randn(n_states)
+        self.vars: np.ndarray = np.ones(n_states)
+        self.pi: np.ndarray = np.full(n_states, 1.0 / n_states)
 
-def risk_adjusted_metrics(returns: np.ndarray, rf: float = 0.01) -> Dict[str, float]:
+    def _emission_probs(self, observations: np.ndarray) -> np.ndarray:
+        """
+        Calculate the emission probabilities for the observations.
+        """
+        T: int = observations.shape[0]
+        obs = observations.reshape(-1, 1)
+        coef = 1.0 / np.sqrt(2 * math.pi * self.vars)
+        exponents = -((obs - self.means) ** 2) / (2 * self.vars)
+        return coef * np.exp(exponents)
+
+    @profile
+    def _fit_single(self, observations: np.ndarray, n_iter: int = 10) -> float:
+        """
+        Fit the HMM using the EM algorithm.
+        """
+        T: int = observations.shape[0]
+        log_likelihood: float = -np.inf
+        for iteration in range(n_iter):
+            E = self._emission_probs(observations)
+            alpha = np.zeros((T, self.n_states))
+            scale = np.zeros(T)
+            alpha[0] = self.pi * E[0]
+            scale[0] = alpha[0].sum()
+            alpha[0] /= (scale[0] + 1e-12)
+            for t in range(1, T):
+                alpha[t] = E[t] * np.dot(alpha[t - 1], self.trans_mat)
+                scale[t] = alpha[t].sum()
+                alpha[t] /= (scale[t] + 1e-12)
+            beta = np.zeros((T, self.n_states))
+            beta[T - 1] = np.ones(self.n_states) / (scale[T - 1] + 1e-12)
+            for t in range(T - 2, -1, -1):
+                beta[t] = np.dot(self.trans_mat, (E[t + 1] * beta[t + 1]))
+                beta[t] /= (scale[t] + 1e-12)
+            gamma = alpha * beta
+            gamma /= (gamma.sum(axis=1, keepdims=True) + 1e-12)
+            num = alpha[:-1, :, None] * self.trans_mat[None, :, :] * E[1:, None, :] * beta[1:, None, :]
+            denom = num.sum(axis=(1, 2), keepdims=True) + 1e-12
+            xi = num / denom
+            self.trans_mat = xi.sum(axis=0) / (xi.sum(axis=(0, 2), keepdims=True) + 1e-12)
+            self.trans_mat = self.trans_mat.squeeze()
+            gamma_sum = gamma.sum(axis=0)
+            self.means = (gamma * observations.reshape(-1, 1)).sum(axis=0) / (gamma_sum + 1e-12)
+            self.vars = (gamma * (observations.reshape(-1, 1) - self.means) ** 2).sum(axis=0) / (gamma_sum + 1e-12)
+            self.pi = gamma[0]
+            log_likelihood = np.sum(np.log(scale + 1e-12))
+            logger.debug(f"HMM Iteration {iteration+1}/{n_iter}, Log Likelihood: {log_likelihood:.4f}")
+        return log_likelihood
+
+    def fit(self, observations: np.ndarray, n_iter: int = 10, parallel: bool = False, n_init: int = 1) -> float:
+        """
+        Fit the HMM model.
+        """
+        if parallel and n_init > 1:
+            best_model = fit_parallel_hmm(observations, self.n_states, n_iter, n_init)
+            self.trans_mat = best_model.trans_mat
+            self.means = best_model.means
+            self.vars = best_model.vars
+            self.pi = best_model.pi
+            log_likelihood = np.sum(np.log(self._emission_probs(observations).sum(axis=1) + 1e-12))
+            logger.info(f"Selected best HMM from parallel fits with log likelihood: {log_likelihood:.4f}")
+            return log_likelihood
+        else:
+            return self._fit_single(observations, n_iter)
+
+    def predict(self, observations: np.ndarray) -> np.ndarray:
+        """
+        Predict the state sequence for the observations.
+        """
+        T: int = observations.shape[0]
+        N: int = self.n_states
+        E = self._emission_probs(observations)
+        delta = np.zeros((T, N))
+        psi = np.zeros((T, N), dtype=int)
+        delta[0] = np.log(self.pi + 1e-12) + np.log(E[0] + 1e-12)
+        for t in range(1, T):
+            for j in range(N):
+                temp = delta[t - 1] + np.log(self.trans_mat[:, j] + 1e-12)
+                psi[t, j] = np.argmax(temp)
+                delta[t, j] = np.max(temp) + np.log(E[t, j] + 1e-12)
+        states = np.zeros(T, dtype=int)
+        states[T - 1] = np.argmax(delta[T - 1])
+        for t in range(T - 2, -1, -1):
+            states[t] = psi[t + 1, states[t + 1]]
+        return states
+
+def _fit_instance_hmm(observations: np.ndarray, n_states: int, n_iter: int, seed: int) -> dict:
     """
-    Compute Sharpe, Sortino, Treynor, and Calmar ratios from returns.
+    Helper to fit a single HMM instance for parallel processing.
     """
-    std = np.std(returns)
-    sharpe = np.mean(returns - rf) / (std + 1e-6) if std > 0 else 0.0
-    downside = np.std([r for r in returns if r < rf])
-    sortino = np.mean(returns - rf) / (downside + 1e-6) if downside > 0 else 0.0
-    beta = 1.0  # Placeholder: implement beta calculation against a benchmark if available.
-    treynor = np.mean(returns - rf) / (beta + 1e-6)
-    max_drawdown = np.max(np.maximum.accumulate(returns) - returns)
-    calmar = np.mean(returns - rf) / (max_drawdown + 1e-6)
-    return {"Sharpe": sharpe, "Sortino": sortino, "Treynor": treynor, "Calmar": calmar}
+    model = HiddenMarkovModel(n_states=n_states, seed=seed)
+    ll = model._fit_single(observations, n_iter)
+    return {
+        'log_likelihood': ll,
+        'trans_mat': model.trans_mat,
+        'means': model.means,
+        'vars': model.vars,
+        'pi': model.pi
+    }
+
+def fit_parallel_hmm(observations: np.ndarray, n_states: int, n_iter: int = 10, n_init: int = 4) -> HiddenMarkovModel:
+    """
+    Fit HMM in parallel and select the best model.
+    """
+    best_result = None
+    best_ll = -np.inf
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        futures = [executor.submit(_fit_instance_hmm, observations, n_states, n_iter, seed)
+                   for seed in range(n_init)]
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            if res['log_likelihood'] > best_ll:
+                best_ll = res['log_likelihood']
+                best_result = res
+    best_model = HiddenMarkovModel(n_states=n_states)
+    best_model.trans_mat = best_result['trans_mat']
+    best_model.means = best_result['means']
+    best_model.vars = best_result['vars']
+    best_model.pi = best_result['pi']
+    logger.info(f"Best log likelihood from parallel HMM fits: {best_ll:.4f}")
+    return best_model
+
+# -----------------------------
+# Technical Indicators & Option Pricing (continued)
+# -----------------------------
+# (The TechnicalIndicators and OptionPricing classes are defined above.)
 
 # -----------------------------
 # Feature Extraction, Augmentation, and PCA
@@ -846,7 +863,7 @@ def pca_reduce(features: pd.DataFrame, n_components: int = 10) -> pd.DataFrame:
     return pd.DataFrame(X_reduced, index=features.index)
 
 # -----------------------------
-# Neural Network with Advanced Autodiff using JAX
+# Neural Network with Advanced Autodiff using JAX (with Dropout and Extended Activations)
 # -----------------------------
 class NeuralNetworkJAX:
     """
@@ -871,15 +888,19 @@ class NeuralNetworkJAX:
         self.hidden_layers: List[int] = hidden_layers
         self.activation_name: str = activation
         self.learning_rate: float = learning_rate
-        self.dropout_rate: float = dropout_rate  # Not fully implemented; placeholder for future extension.
+        self.dropout_rate: float = dropout_rate
         self.regularization: float = regularization
         self.version: str = version
         self.loss_history: List[float] = []
-        # Map activation name to function; can be extended
+        # Extended mapping for activation functions
         self.activation_fn: Callable[[jnp.ndarray], jnp.ndarray] = {
             "sin": jnp.sin,
             "relu": jax.nn.relu,
-            "tanh": jnp.tanh
+            "tanh": jnp.tanh,
+            "sigmoid": jax.nn.sigmoid,
+            "leaky_relu": lambda x: jax.nn.leaky_relu(x, negative_slope=0.01),
+            "elu": jax.nn.elu,
+            "gelu": jax.nn.gelu
         }.get(activation, jnp.sin)
         # Initialize parameters for each layer
         layers = [input_dim] + hidden_layers + [output_dim]
@@ -888,27 +909,36 @@ class NeuralNetworkJAX:
             self.params[f"W{i+1}"] = jnp.array(np.random.randn(layers[i], layers[i+1]) * 0.1)
             self.params[f"b{i+1}"] = jnp.array(np.zeros(layers[i+1]))
 
-    def forward(self, X: jnp.ndarray, params: Optional[Dict[str, jnp.ndarray]] = None) -> jnp.ndarray:
+    def forward(self, X: jnp.ndarray, params: Optional[Dict[str, jnp.ndarray]] = None,
+                dropout_key: Optional[jnp.ndarray] = None, is_training: bool = True) -> jnp.ndarray:
         """
-        Forward pass of the network.
+        Forward pass of the network with optional dropout.
         """
         if params is None:
             params = self.params
         a = X
         num_layers = len(self.hidden_layers) + 1
+        key = dropout_key
         for i in range(1, num_layers + 1):
             z = jnp.dot(a, params[f"W{i}"]) + params[f"b{i}"]
             if i < num_layers:
                 a = self.activation_fn(z)
+                if is_training and self.dropout_rate > 0.0:
+                    if key is None:
+                        key = random.PRNGKey(int(time.time()))
+                    key, subkey = random.split(key)
+                    # Apply dropout mask and scale activations
+                    mask = random.bernoulli(subkey, p=1.0 - self.dropout_rate, shape=a.shape)
+                    a = a * mask / (1.0 - self.dropout_rate)
             else:
-                a = z  # output layer
+                a = z  # Output layer (no dropout)
         return a
 
     def loss(self, params: Dict[str, jnp.ndarray], X: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
         """
         Compute mean squared error loss with optional L2 regularization.
         """
-        pred = self.forward(X, params)
+        pred = self.forward(X, params, is_training=True)
         mse = jnp.mean((pred - y) ** 2)
         l2_reg = sum(jnp.sum(jnp.square(p)) for p in params.values())
         return mse + self.regularization * l2_reg
@@ -926,14 +956,16 @@ class NeuralNetworkJAX:
         params = self.params
 
         @jit
-        def update_params(params, X_jax, y_jax):
+        def update_params(params, X_jax, y_jax, key):
             l = self.loss(params, X_jax, y_jax)
             grads = loss_grad(params, X_jax, y_jax)
             new_params = {k: params[k] - self.learning_rate * grads[k] for k in params}
             return new_params, l
 
+        key = random.PRNGKey(int(time.time()))
         for epoch in range(epochs):
-            params, l = update_params(params, X_jax, y_jax)
+            key, subkey = random.split(key)
+            params, l = update_params(params, X_jax, y_jax, subkey)
             self.loss_history.append(float(l))
             if l < best_loss:
                 best_loss = l
@@ -958,10 +990,10 @@ class NeuralNetworkJAX:
 
     def predict(self, X: np.ndarray) -> jnp.ndarray:
         """
-        Predict outputs for given inputs.
+        Predict outputs for given inputs (without dropout).
         """
         X_jax = jnp.array(X)
-        return self.forward(X_jax)
+        return self.forward(X_jax, is_training=False)
 
 # -----------------------------
 # Heston Simulation using JAX & lax.fori_loop
@@ -1095,12 +1127,14 @@ def process_ticker(ticker: str) -> Optional[Dict[str, Any]]:
         delta, gamma, theta, vega = calculate_option_greeks(latest_close, strike, T, r, sigma)
         sentiment = loop.run_until_complete(DataFetcher().fetch_news_sentiment(ticker))
         returns = np.log(df["Close"] / df["Close"].shift(1)).dropna().values
+        # Fetch benchmark returns for beta calculation
+        benchmark_returns = get_benchmark_returns(start=str(df.index[0].date()), end=str(df.index[-1].date()))
+        risk_metrics = {"RiskMetrics": risk_adjusted_metrics(returns, benchmark=benchmark_returns)}
         # Fit HMM in parallel
         hmm = HiddenMarkovModel(n_states=2)
         hmm.fit(returns, n_iter=10, parallel=True, n_init=4)
         regimes = hmm.predict(returns)
         regime = regimes[-1]
-        risk_metrics = {"RiskMetrics": risk_adjusted_metrics(returns)}
         result = {
             "Ticker": ticker,
             "LatestClose": latest_close,
@@ -1261,10 +1295,10 @@ def run_tests() -> None:
     res_gpu = gpu.vector_multiply(a, b)
     assert np.allclose(res_gpu, a * b), "GPU routine test failed."
     
-    # Test NeuralNetworkJAX forward and gradient
+    # Test NeuralNetworkJAX forward and gradient with dropout
     X_test = np.random.rand(5, 10)
     y_test = np.random.rand(5, 1)
-    nn_jax = NeuralNetworkJAX(input_dim=10, output_dim=1)
+    nn_jax = NeuralNetworkJAX(input_dim=10, output_dim=1, dropout_rate=0.2, activation="relu")
     l_val = nn_jax.loss(nn_jax.params, jnp.array(X_test), jnp.array(y_test))
     g = grad(nn_jax.loss)(nn_jax.params, jnp.array(X_test), jnp.array(y_test))
     for key in nn_jax.params:
