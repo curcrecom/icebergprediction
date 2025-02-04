@@ -98,9 +98,6 @@ class ModelTrainingError(Exception):
 # Decorators
 # -----------------------------
 def retry(exceptions: Tuple[Exception, ...], tries: int = 3, delay: float = 1, backoff: int = 2) -> Callable:
-    """
-    Retry decorator for synchronous functions.
-    """
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -118,9 +115,6 @@ def retry(exceptions: Tuple[Exception, ...], tries: int = 3, delay: float = 1, b
     return decorator
 
 def async_retry(exceptions: Tuple[Exception, ...], tries: int = 3, delay: float = 1, backoff: int = 2) -> Callable:
-    """
-    Retry decorator for asynchronous functions.
-    """
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         async def wrapper(*args, **kwargs):
@@ -138,9 +132,6 @@ def async_retry(exceptions: Tuple[Exception, ...], tries: int = 3, delay: float 
     return decorator
 
 def profile(func: Callable) -> Callable:
-    """
-    Profiling decorator that logs the execution time.
-    """
     @wraps(func)
     def wrapper(*args, **kwargs):
         start = time.perf_counter()
@@ -154,7 +145,6 @@ def profile(func: Callable) -> Callable:
 # Utility Functions
 # -----------------------------
 def atomic_save(cache: Dict[str, Any], filename: str) -> None:
-    """Atomically save the cache dictionary as JSON."""
     temp_filename = filename + ".tmp"
     try:
         with open(temp_filename, 'w') as f:
@@ -166,24 +156,26 @@ def atomic_save(cache: Dict[str, Any], filename: str) -> None:
 # -----------------------------
 # Optimized CPU Kernel (Numba)
 # -----------------------------
-@njit(parallel=True, fastmath=True)
+@njit(fastmath=True, parallel=True)
 def fast_cpu_distance(x: np.ndarray, y: np.ndarray) -> float:
-    """Calculate the squared distance between two arrays using Numba for acceleration."""
-    n = x.shape[0]
+    """
+    Calculate the squared distance between two arrays using vectorized operations and manual loop unrolling.
+    """
+    diff = x - y
     total = 0.0
-    for i in prange(n):
-        diff = x[i] - y[i]
-        total += diff * diff
+    n = diff.shape[0]
+    unroll_factor = 4
+    limit = n - (n % unroll_factor)
+    for i in range(0, limit, unroll_factor):
+        total += diff[i] * diff[i] + diff[i+1] * diff[i+1] + diff[i+2] * diff[i+2] + diff[i+3] * diff[i+3]
+    for i in range(limit, n):
+        total += diff[i] * diff[i]
     return total
 
 # -----------------------------
 # GPU Accelerator using Metal (metalcompute)
 # -----------------------------
 class GPUAccelerator:
-    """
-    GPU accelerator using Apple's Metal API via the metalcompute package.
-    Provides element-wise vector multiplication.
-    """
     def __init__(self) -> None:
         try:
             self.device = mc.Device()
@@ -209,7 +201,6 @@ class GPUAccelerator:
             raise GPUInitializationError(e)
     
     def vector_multiply(self, a_np: np.ndarray, b_np: np.ndarray) -> np.ndarray:
-        """Multiply two vectors using the GPU."""
         a = np.ascontiguousarray(a_np.astype(np.float32))
         b = np.ascontiguousarray(b_np.astype(np.float32))
         count = a.shape[0]
@@ -231,9 +222,6 @@ class GPUAccelerator:
 # FinBERT Sentiment Analysis
 # -----------------------------
 class SentimentTransformer:
-    """
-    FinBERT-based sentiment transformer for analyzing financial text sentiment.
-    """
     def __init__(self) -> None:
         try:
             self.pipeline = pipeline("sentiment-analysis",
@@ -245,7 +233,6 @@ class SentimentTransformer:
             raise
 
     def analyze(self, text: str) -> float:
-        """Analyze the sentiment of the text and return a score."""
         result = self.pipeline(text[:512])
         if result and result[0]['label'].upper() == "POSITIVE":
             return result[0]['score']
@@ -261,9 +248,6 @@ class SentimentTransformer:
 # Data Fetching & Caching
 # -----------------------------
 class DataFetcher:
-    """
-    Fetches stock data and news sentiment while caching results.
-    """
     def __init__(self, cache_file: str = CACHE_FILE) -> None:
         self.cache_file: str = cache_file
         self.cache: Dict[str, Any] = {}
@@ -281,7 +265,6 @@ class DataFetcher:
 
     @retry((DataFetchError, Exception), tries=3, delay=2, backoff=2)
     async def async_fetch_stock_data(self, ticker: str, period: str = '5y') -> pd.DataFrame:
-        """Fetch historical stock data asynchronously, using cache if available."""
         if ticker in self.cache:
             logger.info(f"Loading cached data for ticker: {ticker}")
             df = pd.read_json(self.cache[ticker], convert_dates=True)
@@ -300,7 +283,6 @@ class DataFetcher:
 
     @async_retry((NetworkError, Exception), tries=3, delay=2, backoff=2)
     async def fetch_news_sentiment(self, ticker: str) -> float:
-        """Fetch news articles for a ticker and calculate an aggregated sentiment score."""
         import aiohttp
         from bs4 import BeautifulSoup
         urls: List[str] = [
@@ -330,29 +312,21 @@ class DataFetcher:
 # Option Greeks and Pricing
 # -----------------------------
 def calculate_option_greeks(S: float, K: float, T: float, r: float, sigma: float, option_type: str = 'call') -> Tuple[float, float, float, float]:
-    """
-    Calculate option Greeks: Delta, Gamma, Theta, and Vega.
-    """
     d1 = (math.log(S / K) + (r + sigma**2 / 2) * T) / (sigma * math.sqrt(T) + 1e-12)
     d2 = d1 - sigma * math.sqrt(T)
     N = lambda x: 0.5 * (1 + math.erf(x / math.sqrt(2)))
     n = lambda x: math.exp(-0.5 * x**2) / math.sqrt(2 * math.pi)
     if option_type.lower() == "call":
         delta = N(d1)
-        theta = (-S * n(d1) * sigma / (2 * math.sqrt(T)) 
-                 - r * K * math.exp(-r * T) * N(d2))
+        theta = (-S * n(d1) * sigma / (2 * math.sqrt(T)) - r * K * math.exp(-r * T) * N(d2))
     else:
         delta = N(d1) - 1
-        theta = (-S * n(d1) * sigma / (2 * math.sqrt(T)) 
-                 + r * K * math.exp(-r * T) * N(-d2))
+        theta = (-S * n(d1) * sigma / (2 * math.sqrt(T)) + r * K * math.exp(-r * T) * N(-d2))
     gamma = n(d1) / (S * sigma * math.sqrt(T) + 1e-12)
     vega = S * math.sqrt(T) * n(d1)
     return delta, gamma, theta, vega
 
 def get_benchmark_returns(benchmark_ticker: str = "^GSPC", start: Optional[str] = None, end: Optional[str] = None) -> np.ndarray:
-    """
-    Fetch benchmark returns (e.g., S&P 500) over a specified date range.
-    """
     try:
         benchmark = yf.Ticker(benchmark_ticker)
         df_bench = benchmark.history(start=start, end=end).dropna()
@@ -363,9 +337,6 @@ def get_benchmark_returns(benchmark_ticker: str = "^GSPC", start: Optional[str] 
         return np.array([])
 
 def risk_adjusted_metrics(returns: np.ndarray, benchmark: Optional[np.ndarray] = None, rf: float = 0.01) -> Dict[str, float]:
-    """
-    Compute various risk-adjusted metrics including Sharpe, Sortino, Treynor, Calmar ratios and Beta.
-    """
     std = np.std(returns)
     sharpe = np.mean(returns - rf) / (std + 1e-6) if std > 0 else 0.0
     downside = np.std([r for r in returns if r < rf])
@@ -381,10 +352,8 @@ def risk_adjusted_metrics(returns: np.ndarray, benchmark: Optional[np.ndarray] =
     calmar = np.mean(returns - rf) / (max_drawdown + 1e-6)
     return {"Sharpe": sharpe, "Sortino": sortino, "Treynor": treynor, "Calmar": calmar, "Beta": beta}
 
+# Option Pricing Models with enhancements
 class OptionPricing:
-    """
-    Option pricing models including Black–Scholes, Binomial, Monte Carlo (CPU) and a GPU-accelerated Monte Carlo.
-    """
     @staticmethod
     def black_scholes(S: float, K: float, T: float, r: float, sigma: float, option_type: str = 'call') -> float:
         d1 = (math.log(S / K) + (r + sigma**2 / 2) * T) / (sigma * math.sqrt(T))
@@ -396,15 +365,8 @@ class OptionPricing:
 
     @staticmethod
     def binomial(S: float, K: float, T: float, r: float, sigma: float, N: int = 100, option_type: str = 'call') -> float:
-        dt = T / N
-        u = math.exp(sigma * math.sqrt(dt))
-        d = 1 / u
-        p = (math.exp(r * dt) - d) / (u - d)
-        asset_prices = np.array([S * (u**j) * (d**(N - j)) for j in range(N + 1)])
-        option_values = np.maximum(asset_prices - K, 0) if option_type.lower() == 'call' else np.maximum(K - asset_prices, 0)
-        for i in range(N, 0, -1):
-            option_values = math.exp(-r * dt) * (p * option_values[1:i + 1] + (1 - p) * option_values[0:i])
-        return option_values[0]
+        # Use the accelerated binomial pricing function with loop unrolling
+        return binomial_option_unrolled(S, K, T, r, sigma, N, option_type)
 
     @staticmethod
     def monte_carlo(S: float, K: float, T: float, r: float, sigma: float, simulations: int = 10000, option_type: str = 'call') -> float:
@@ -416,14 +378,10 @@ class OptionPricing:
 
     @staticmethod
     def monte_carlo_gpu(S: float, K: float, T: float, r: float, sigma: float, simulations: int = 10000, option_type: str = 'call') -> float:
-        """
-        GPU-accelerated Monte Carlo simulation using JAX.
-        """
         dt = T
         key = random.PRNGKey(int(time.time()))
         rand = random.normal(key, shape=(simulations,))
-        ST = S * jnp.exp((r - 0.5 * sigma**2)*dt + sigma * jnp.sqrt(dt) * rand)
-        # Use jnp.where for vectorized branch selection
+        ST = S * jnp.exp((r - 0.5 * sigma**2) * dt + sigma * jnp.sqrt(dt) * rand)
         payoffs = jnp.where(option_type.lower()=='call', jnp.maximum(ST - K, 0), jnp.maximum(K - ST, 0))
         return float(jnp.exp(-r * T) * jnp.mean(payoffs))
 
@@ -437,11 +395,48 @@ class OptionPricing:
             price += poisson_prob * OptionPricing.black_scholes(S, K, T, r, sigma_k, option_type)
         return price
 
+@njit(fastmath=True)
+def binomial_option_unrolled(S: float, K: float, T: float, r: float, sigma: float, N: int, option_type: str) -> float:
+    dt = T / N
+    u = math.exp(sigma * math.sqrt(dt))
+    d = 1.0 / u
+    p = (math.exp(r * dt) - d) / (u - d)
+    
+    asset_prices = np.empty(N + 1, dtype=np.float64)
+    for j in range(N + 1):
+        asset_prices[j] = S * (u ** j) * (d ** (N - j))
+    
+    if option_type.lower() == 'call':
+        for j in range(N + 1):
+            asset_prices[j] = asset_prices[j] - K if asset_prices[j] > K else 0.0
+    else:
+        for j in range(N + 1):
+            asset_prices[j] = K - asset_prices[j] if asset_prices[j] < K else 0.0
+
+    unroll_factor = 4
+    for i in range(N, 0, -1):
+        discount = math.exp(-r * dt)
+        total_steps = i
+        limit = total_steps - (total_steps % unroll_factor)
+        j = 0
+        while j < limit:
+            asset_prices[j] = discount * (p * asset_prices[j + 1] + (1.0 - p) * asset_prices[j])
+            asset_prices[j + 1] = discount * (p * asset_prices[j + 2] + (1.0 - p) * asset_prices[j + 1])
+            asset_prices[j + 2] = discount * (p * asset_prices[j + 3] + (1.0 - p) * asset_prices[j + 2])
+            if (j + 4) < total_steps:
+                asset_prices[j + 3] = discount * (p * asset_prices[j + 4] + (1.0 - p) * asset_prices[j + 3])
+            else:
+                asset_prices[j + 3] = discount * (p * asset_prices[j + 3] + (1.0 - p) * asset_prices[j + 3])
+            j += unroll_factor
+        while j < total_steps:
+            asset_prices[j] = discount * (p * asset_prices[j + 1] + (1.0 - p) * asset_prices[j])
+            j += 1
+    return asset_prices[0]
+
 # -----------------------------
 # Technical Indicators
 # -----------------------------
 class TechnicalIndicators:
-    """Collection of technical indicator functions."""
     @staticmethod
     def WMA(series: pd.Series, period: int) -> pd.Series:
         weights = np.arange(1, period + 1)
@@ -575,9 +570,6 @@ class TechnicalIndicators:
 # Hidden Markov Model (HMM)
 # -----------------------------
 class HiddenMarkovModel:
-    """
-    A Hidden Markov Model for identifying market regimes.
-    """
     def __init__(self, n_states: int = 2, seed: Optional[int] = None) -> None:
         self.n_states: int = n_states
         if seed is not None:
@@ -630,9 +622,6 @@ class HiddenMarkovModel:
         return log_likelihood
 
     def fit(self, observations: np.ndarray, n_iter: int = 10, parallel: bool = False, n_init: int = 1) -> float:
-        """
-        Fit the HMM to observations. Use parallel fits if specified.
-        """
         if parallel and n_init > 1:
             best_model = fit_parallel_hmm(observations, self.n_states, n_iter, n_init)
             self.trans_mat = best_model.trans_mat
@@ -645,9 +634,6 @@ class HiddenMarkovModel:
         return self._fit_single(observations, n_iter)
 
     def predict(self, observations: np.ndarray) -> np.ndarray:
-        """
-        Predict the hidden state sequence for the given observations.
-        """
         T: int = observations.shape[0]
         N: int = self.n_states
         E = self._emission_probs(observations)
@@ -699,7 +685,6 @@ def fit_parallel_hmm(observations: np.ndarray, n_states: int, n_iter: int = 10, 
 # Feature Extraction and Reduction
 # -----------------------------
 def extract_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Extract key features and technical indicators from the input DataFrame."""
     features = pd.DataFrame(index=df.index)
     features["Close"] = df["Close"]
     features["WMA"] = TechnicalIndicators.WMA(df["Close"], 20)
@@ -726,11 +711,9 @@ def extract_features(df: pd.DataFrame) -> pd.DataFrame:
     return features.fillna(method="bfill").fillna(method="ffill")
 
 def augment_features(features: pd.DataFrame) -> pd.DataFrame:
-    """Augment features by adding slight Gaussian noise."""
     return features + np.random.normal(0, 0.001, size=features.shape)
 
 def pca_reduce(features: pd.DataFrame, n_components: int = 10) -> pd.DataFrame:
-    """Reduce feature dimensions using SVD-based PCA."""
     X = features.values
     U, s, _ = svd(X - np.mean(X, axis=0), full_matrices=False)
     X_reduced = U[:, :n_components] * s[:n_components]
@@ -740,9 +723,6 @@ def pca_reduce(features: pd.DataFrame, n_components: int = 10) -> pd.DataFrame:
 # Neural Network with JAX (GPU accelerated)
 # -----------------------------
 class NeuralNetworkJAX:
-    """
-    A neural network implementation using JAX with support for dropout and various activations.
-    """
     def __init__(self,
                  input_dim: int,
                  output_dim: int,
@@ -782,9 +762,6 @@ class NeuralNetworkJAX:
 
     def forward(self, X: jnp.ndarray, params: Optional[Dict[str, jnp.ndarray]] = None,
                 dropout_key: Optional[jnp.ndarray] = None, is_training: bool = True) -> jnp.ndarray:
-        """
-        Forward pass through the network.
-        """
         if params is None:
             params = self.params
         a = X
@@ -804,9 +781,6 @@ class NeuralNetworkJAX:
         return a
 
     def loss(self, params: Dict[str, jnp.ndarray], X: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-        """
-        Mean squared error loss with L2 regularization.
-        """
         pred = self.forward(X, params, is_training=True)
         mse = jnp.mean((pred - y) ** 2)
         l2_reg = sum(jnp.sum(jnp.square(p)) for p in params.values())
@@ -814,7 +788,6 @@ class NeuralNetworkJAX:
 
     @profile
     def train(self, X: np.ndarray, y: np.ndarray, epochs: int = 100, early_stopping: int = 10) -> List[float]:
-        """Train the network and plot the loss history."""
         X_jax = jnp.array(X)
         y_jax = jnp.array(y)
         loss_grad = grad(self.loss)
@@ -855,7 +828,6 @@ class NeuralNetworkJAX:
         return self.loss_history
 
     def predict(self, X: np.ndarray) -> jnp.ndarray:
-        """Predict using the trained network."""
         X_jax = jnp.array(X)
         return self.forward(X_jax, is_training=False)
 
@@ -865,9 +837,6 @@ class NeuralNetworkJAX:
 @partial(jit, static_argnames=['N', 'M'])
 def heston_model_sim_jax(S0: float, v0: float, rho: float, kappa: float, theta: float,
                          sigma: float, r: float, T: float, N: int, M: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    Simulate asset prices and variances using the Heston model.
-    """
     dt = T / N
     mu = jnp.array([0.0, 0.0])
     cov = jnp.array([[1.0, rho], [rho, 1.0]])
@@ -895,7 +864,6 @@ def heston_model_sim_jax(S0: float, v0: float, rho: float, kappa: float, theta: 
 # Dashboard for Real-Time Monitoring
 # -----------------------------
 def start_dashboard(metrics_data: Dict[str, Any]) -> None:
-    """Launch a Dash dashboard to monitor live performance metrics."""
     app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
     app.layout = dbc.Container([
         dbc.Row([dbc.Col(html.H2("Live Performance Dashboard"), width=12)]),
@@ -926,9 +894,6 @@ def start_dashboard(metrics_data: Dict[str, Any]) -> None:
 # Optimization Functions
 # -----------------------------
 def advanced_bayesian_optimization_lr(X_train: np.ndarray, y_train: np.ndarray, n_iter: int = 25) -> Tuple[float, Any]:
-    """
-    Use Bayesian Optimization to select the best learning rate.
-    """
     def objective_lr(lr: float) -> float:
         nn = NeuralNetworkJAX(input_dim=X_train.shape[1], output_dim=1, learning_rate=lr)
         loss_history = nn.train(X_train, y_train, epochs=10, early_stopping=3)
@@ -945,10 +910,6 @@ def advanced_bayesian_optimization_lr(X_train: np.ndarray, y_train: np.ndarray, 
     return best_lr, optimizer
 
 def walk_forward_optimization(features: pd.DataFrame, targets: pd.Series, window: int = 100) -> List[Tuple[Any, float]]:
-    """
-    Walk-forward optimization: train the model on rolling windows and generate predictions.
-    Parallelize the window processing using a ThreadPoolExecutor.
-    """
     predictions: List[Tuple[Any, float]] = []
     def process_window(start):
         X_train = features.iloc[start:start + window].values
@@ -968,10 +929,6 @@ def walk_forward_optimization(features: pd.DataFrame, targets: pd.Series, window
 # Helper: Asynchronous GPU Option Pricing
 # -----------------------------
 async def _fetch_option_prices(latest_close: float, strike: float, T: float, r: float, sigma: float) -> Tuple[float, float, float]:
-    """
-    Concurrently compute option prices using GPU-accelerated or parallelized functions.
-    Offload the work to separate threads.
-    """
     bs_task = asyncio.to_thread(OptionPricing.black_scholes, latest_close, strike, T, r, sigma, "call")
     binom_task = asyncio.to_thread(OptionPricing.binomial, latest_close, strike, T, r, sigma, 100, "call")
     mc_task = asyncio.to_thread(OptionPricing.monte_carlo_gpu, latest_close, strike, T, r, sigma, 10000, "call")
@@ -981,10 +938,6 @@ async def _fetch_option_prices(latest_close: float, strike: float, T: float, r: 
 # Ticker Processing Functions
 # -----------------------------
 def process_ticker(ticker: str) -> Optional[Dict[str, Any]]:
-    """
-    Process a single ticker: fetch data, extract features, run predictions, price options, and compute risk metrics.
-    GPU-accelerated computations (such as the Monte Carlo simulation) are offloaded concurrently.
-    """
     try:
         data_fetcher = DataFetcher()
         df = asyncio.run(data_fetcher.async_fetch_stock_data(ticker))
@@ -996,12 +949,11 @@ def process_ticker(ticker: str) -> Optional[Dict[str, Any]]:
         predictions = walk_forward_optimization(reduced, target)
         latest_close = df["Close"].iloc[-1]
         strike = latest_close
-        r = 0.01
-        T = 4 / 252
-        sigma = np.std(np.log(df["Close"] / df["Close"].shift(1)).dropna()) * math.sqrt(252)
-        # Offload option pricing concurrently (using GPU-accelerated monte_carlo_gpu)
-        bs_price, binom_price, mc_price = asyncio.run(_fetch_option_prices(latest_close, strike, T, r, sigma))
-        delta, gamma, theta, vega = calculate_option_greeks(latest_close, strike, T, r, sigma)
+        r_val = 0.01
+        T_val = 4 / 252
+        sigma_val = np.std(np.log(df["Close"] / df["Close"].shift(1)).dropna()) * math.sqrt(252)
+        bs_price, binom_price, mc_price = asyncio.run(_fetch_option_prices(latest_close, strike, T_val, r_val, sigma_val))
+        delta, gamma, theta, vega = calculate_option_greeks(latest_close, strike, T_val, r_val, sigma_val)
         sentiment = asyncio.run(data_fetcher.fetch_news_sentiment(ticker))
         returns = np.log(df["Close"] / df["Close"].shift(1)).dropna().values
         benchmark_returns = get_benchmark_returns(start=str(df.index[0].date()), end=str(df.index[-1].date()))
@@ -1032,13 +984,11 @@ def process_ticker(ticker: str) -> Optional[Dict[str, Any]]:
         return None
 
 def parallel_ticker_processing(tickers: List[str]) -> List[Dict[str, Any]]:
-    """Process multiple tickers in parallel."""
     with mp.Pool(processes=min(len(tickers), mp.cpu_count())) as pool:
         results = pool.map(process_ticker, tickers)
     return [res for res in results if res is not None]
 
 def gpu_vector_test() -> Optional[np.ndarray]:
-    """Test the GPU vector multiplication routine."""
     try:
         gpu_accel = GPUAccelerator()
         a = np.random.rand(1000000)
@@ -1054,9 +1004,6 @@ def gpu_vector_test() -> Optional[np.ndarray]:
         return None
 
 def build_prediction_table(results: List[Dict[str, Any]]) -> Optional[pd.DataFrame]:
-    """
-    Build a table of predictions for tickers with significant predicted call option increases.
-    """
     rows: List[Dict[str, Any]] = []
     for res in results:
         if res.get("Predictions"):
@@ -1073,9 +1020,6 @@ def build_prediction_table(results: List[Dict[str, Any]]) -> Optional[pd.DataFra
     return pd.DataFrame(rows) if rows else None
 
 def plot_performance_metrics(results: List[Dict[str, Any]]) -> None:
-    """
-    Plot scatter metrics of news sentiment vs. Black–Scholes price.
-    """
     tickers = [res["Ticker"] for res in results if res is not None]
     sentiments = [res["Sentiment"] for res in results if res is not None]
     bs_prices = [res["BS_Price"] for res in results if res is not None]
@@ -1144,17 +1088,17 @@ def main() -> None:
 def run_tests() -> None:
     import matplotlib.pyplot as plt
     logger.info("Running unit tests...")
-    # Numba CPU test
+    # Test optimized CPU distance
     a = np.array([1.0, 2.0, 3.0])
     b = np.array([1.0, 2.0, 3.0])
     cpu_result = fast_cpu_distance(a, b)
     assert abs(cpu_result) < 1e-6, "CPU kernel (Numba) test failed."
-    # GPU test
+    # Test GPU vector multiplication
     gpu = GPUAccelerator()
     res_gpu = gpu.vector_multiply(a, b)
     expected = a * b
     assert np.allclose(res_gpu, expected, atol=1e-5), "GPU routine test failed."
-    # JAX neural network test
+    # Test JAX neural network
     X_test = np.random.rand(5, 10)
     y_test = np.random.rand(5, 1)
     nn_jax = NeuralNetworkJAX(input_dim=10, output_dim=1, dropout_rate=0.2, activation="relu")
@@ -1162,11 +1106,11 @@ def run_tests() -> None:
     g = grad(nn_jax.loss)(nn_jax.params, jnp.array(X_test), jnp.array(y_test))
     for key in nn_jax.params:
         assert key in g, f"Missing gradient for {key}"
-    # Sentiment transformer test
+    # Test sentiment transformer
     st = SentimentTransformer()
     score = st.analyze("This is a great day for trading!")
     assert isinstance(score, float), "Sentiment transformer test failed."
-    # Feature extraction test
+    # Test feature extraction
     df_sample = pd.DataFrame({
         "Close": np.linspace(100, 110, 30),
         "Volume": np.random.randint(1000, 5000, 30),
@@ -1175,7 +1119,7 @@ def run_tests() -> None:
     }, index=pd.date_range("2020-01-01", periods=30))
     feats = extract_features(df_sample)
     assert not feats.empty, "Feature extraction test failed."
-    # Retry decorator test
+    # Test retry decorator
     call_counter = {"count": 0}
     @retry(Exception, tries=3, delay=0.1, backoff=1)
     def test_retry_success():
@@ -1184,7 +1128,7 @@ def run_tests() -> None:
             raise ValueError("Failing")
         return "succeeded"
     assert test_retry_success() == "succeeded", "Retry decorator test failed."
-    # Profiling decorator test
+    # Test profiling decorator
     @profile
     def dummy_sleep():
         time.sleep(0.2)
