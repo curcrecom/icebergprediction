@@ -8,6 +8,8 @@ import logging
 import datetime
 import threading
 import argparse
+import io
+
 from functools import wraps, partial
 from typing import Any, Dict, Tuple, List, Optional, Callable
 
@@ -52,9 +54,20 @@ try:
 except ImportError:
     sys.exit("Please install metalcompute (pip install metalcompute)")
 try:
-    from sklearn.cluster import KMeans
+    import hdbscan
+except ImportError:
+    sys.exit("Please install hdbscan (pip install hdbscan)")
+try:
+    from sklearn.cluster import KMeans  # Still kept for other uses if needed.
 except ImportError:
     sys.exit("Please install scikit-learn (pip install scikit-learn)")
+try:
+    import dask
+    from dask import delayed, compute
+except ImportError:
+    sys.exit("Please install dask (pip install dask)")
+
+from logging.handlers import RotatingFileHandler
 
 # -----------------------------
 # Configuration
@@ -66,20 +79,27 @@ CONFIG = {
     "RUN_HOUR": 16,       # 16:00 local time
     "CLUSTER_ASSIGNMENTS": {},
     "DASH_PORT": 8050,    # Configurable dashboard port
+    "CACHE_EXPIRY": 86400  # Cache expiry time in seconds (1 day)
 }
 
 # -----------------------------
-# Logger Setup
+# Logger Setup with Rotating Handler
 # -----------------------------
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(CONFIG["LOG_FILE"], mode='w')
-    ]
-)
-logger: logging.Logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+# Console handler
+ch = logging.StreamHandler(sys.stdout)
+ch.setLevel(logging.DEBUG)
+ch.setFormatter(formatter)
+logger.addHandler(ch)
+
+# Rotating File Handler
+fh = RotatingFileHandler(CONFIG["LOG_FILE"], maxBytes=1 * 1024 * 1024, backupCount=5)
+fh.setLevel(logging.DEBUG)
+fh.setFormatter(formatter)
+logger.addHandler(fh)
 
 # -----------------------------
 # Custom Exceptions
@@ -100,7 +120,6 @@ class ModelTrainingError(Exception):
 # Decorators
 # -----------------------------
 def retry(exceptions: Tuple[Exception, ...], tries: int = 3, delay: float = 1.0, backoff: int = 2) -> Callable:
-    @wraps(func := lambda *args, **kwargs: None)
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -327,7 +346,7 @@ class SentimentTransformer:
         return SentimentTransformer().analyze(text)
 
 # -----------------------------
-# Data Fetching & Caching with Async I/O
+# Data Fetching & Caching with Async I/O using aiohttp and Cache Expiry
 # -----------------------------
 class DataFetcher:
     def __init__(self, cache_file: str = CONFIG["CACHE_FILE"]) -> None:
@@ -347,21 +366,44 @@ class DataFetcher:
 
     @retry((DataFetchError, Exception), tries=3, delay=2, backoff=2)
     async def async_fetch_stock_data(self, ticker: str, period: str = '5y') -> pd.DataFrame:
+        # Check if cached and not expired
+        current_time = time.time()
         if ticker in self.cache:
-            logger.info(f"Loading cached data for ticker: {ticker}")
-            df = pd.read_json(self.cache[ticker], convert_dates=True)
-        else:
-            logger.info(f"Fetching data from yfinance for ticker: {ticker}")
-            try:
-                df = await asyncio.to_thread(lambda: yf.Ticker(ticker).history(period=period))
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = ['_'.join(col).strip() for col in df.columns.values]
-                self.cache[ticker] = df.to_json(date_format='iso')
-                self.save_cache()
-            except Exception as e:
-                logger.error(f"Error fetching data for {ticker}: {e}")
-                raise DataFetchError(e)
-        return df
+            entry = self.cache[ticker]
+            if current_time - entry.get("timestamp", 0) < CONFIG["CACHE_EXPIRY"]:
+                logger.info(f"Loading cached data for ticker: {ticker}")
+                try:
+                    df = pd.read_json(entry["data"], convert_dates=True)
+                    return df
+                except Exception as e:
+                    logger.error(f"Error reading cache for {ticker}: {e}")
+            else:
+                logger.info(f"Cache expired for ticker: {ticker}")
+        # Compute date range based on period (assume '5y')
+        end_date = datetime.datetime.now()
+        start_date = end_date - datetime.timedelta(days=5*365)
+        period1 = int(time.mktime(start_date.timetuple()))
+        period2 = int(time.mktime(end_date.timetuple()))
+        url = (f"https://query1.finance.yahoo.com/v7/finance/download/{ticker}"
+               f"?period1={period1}&period2={period2}&interval=1d&events=history&includeAdjustedClose=true")
+        logger.info(f"Fetching data from Yahoo Finance for ticker: {ticker}")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        raise DataFetchError(f"Failed to fetch data for {ticker}: HTTP {response.status}")
+                    csv_data = await response.text()
+                    df = pd.read_csv(io.StringIO(csv_data), parse_dates=["Date"], index_col="Date")
+                    # Cache the data with current timestamp
+                    self.cache[ticker] = {
+                        "data": df.to_json(date_format='iso'),
+                        "timestamp": current_time
+                    }
+                    self.save_cache()
+                    return df
+        except Exception as e:
+            logger.error(f"Error fetching data for {ticker}: {e}")
+            raise DataFetchError(e)
 
     @async_retry((NetworkError, Exception), tries=3, delay=2, backoff=2)
     async def fetch_news_sentiment(self, ticker: str) -> float:
@@ -933,8 +975,11 @@ def advanced_bayesian_optimization_lr(X_train: np.ndarray, y_train: np.ndarray, 
     logger.info(f"Advanced Bayesian Optimization selected learning_rate = {best_lr}")
     return best_lr, optimizer
 
+# -----------------------------
+# Parallelize Walk-Forward Optimization using Dask
+# -----------------------------
 def walk_forward_optimization(features: pd.DataFrame, targets: pd.Series, window: int = 100) -> List[Tuple[Any, float]]:
-    predictions: List[Tuple[Any, float]] = []
+    @delayed
     def process_window(start):
         X_train = features.iloc[start:start + window].values
         y_train = targets.iloc[start:start + window].values.reshape(-1, 1)
@@ -944,11 +989,12 @@ def walk_forward_optimization(features: pd.DataFrame, targets: pd.Series, window
         X_pred = features.iloc[start + window:start + window + 1].values
         pred_val = float(nn_jax.predict(X_pred)[0])
         return (features.index[start + window], pred_val)
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = {executor.submit(process_window, start): start for start in range(0, len(features) - window, window)}
-        for future in concurrent.futures.as_completed(futures):
-            predictions.append(future.result())
-    return predictions
+    
+    tasks = []
+    for start in range(0, len(features) - window, window):
+        tasks.append(process_window(start))
+    predictions = compute(*tasks)
+    return list(predictions)
 
 # -----------------------------
 # Asynchronous GPU Option Pricing Helper
@@ -1194,17 +1240,22 @@ def perform_clustering(tickers: List[str], n_clusters: int = 2) -> Dict[str, int
             df_friday['return'] = df_friday['Close'].pct_change()
             avg_return = df_friday['return'].mean() if not df_friday['return'].isnull().all() else 0.0
             std_return = df_friday['return'].std() if not df_friday['return'].isnull().all() else 0.0
-            features_list.append([avg_return, std_return])
+            avg_volume = df_friday['Volume'].mean() if not df_friday['Volume'].isnull().all() else 0.0
+            features_list.append([avg_return, std_return, avg_volume])
             valid_tickers.append(ticker)
         except Exception as e:
             logger.error(f"Clustering failed for ticker {ticker}: {e}")
     if not features_list:
         return {}
     X = np.array(features_list)
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-    labels = kmeans.fit_predict(X)
-    logger.info(f"Clustering completed. Centers: {kmeans.cluster_centers_}")
-    return {ticker: label for ticker, label in zip(valid_tickers, labels)}
+    try:
+        clusterer = hdbscan.HDBSCAN(min_cluster_size=3)
+        labels = clusterer.fit_predict(X)
+    except Exception as e:
+        logger.error(f"HDBSCAN clustering failed: {e}")
+        labels = [-1] * len(valid_tickers)
+    logger.info(f"Clustering completed. Labels: {labels}")
+    return {ticker: int(label) for ticker, label in zip(valid_tickers, labels)}
 
 if __name__ == "__main__":
     main()
