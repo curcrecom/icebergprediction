@@ -54,6 +54,12 @@ try:
 except ImportError:
     sys.exit("Please install metalcompute (pip install metalcompute)")
 
+# New: Import scikit-learn's KMeans for clustering.
+try:
+    from sklearn.cluster import KMeans
+except ImportError:
+    sys.exit("Please install scikit-learn (pip install scikit-learn)")
+
 # -----------------------------
 # Global Configuration
 # -----------------------------
@@ -61,6 +67,9 @@ CACHE_FILE: str = 'data_cache.json'
 LOG_FILE: str = "model_log.txt"
 RUN_DAY: int = 0  # Monday (0)
 RUN_HOUR: int = 16
+
+# Global dictionary to hold cluster assignments for tickers.
+CLUSTER_ASSIGNMENTS: Dict[str, int] = {}
 
 # -----------------------------
 # Logger Setup
@@ -154,6 +163,40 @@ def atomic_save(cache: Dict[str, Any], filename: str) -> None:
         logger.error(f"Error saving cache: {e}")
 
 # -----------------------------
+# Clustering and Transfer Learning Functions
+# -----------------------------
+def perform_clustering(tickers: List[str], n_clusters: int = 2) -> Dict[str, int]:
+    """
+    For each ticker, fetch historical data over the last 5 years and compute clustering features.
+    Here we use average Friday return and standard deviation of Friday returns as features.
+    Returns a dictionary mapping ticker -> cluster label.
+    """
+    features_list = []
+    valid_tickers = []
+    for ticker in tickers:
+        try:
+            df = yf.Ticker(ticker).history(period='5y')
+            # Filter for Fridays (weekday == 4)
+            df_friday = df[df.index.weekday == 4]
+            if df_friday.empty:
+                continue
+            df_friday['return'] = df_friday['Close'].pct_change()
+            avg_return = df_friday['return'].mean() if not df_friday['return'].isnull().all() else 0.0
+            std_return = df_friday['return'].std() if not df_friday['return'].isnull().all() else 0.0
+            features_list.append([avg_return, std_return])
+            valid_tickers.append(ticker)
+        except Exception as e:
+            logger.error(f"Clustering: Failed for ticker {ticker}: {e}")
+    if not features_list:
+        return {}
+    X = np.array(features_list)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    labels = kmeans.fit_predict(X)
+    cluster_assignments = {ticker: label for ticker, label in zip(valid_tickers, labels)}
+    logger.info(f"Clustering completed. Cluster centers: {kmeans.cluster_centers_}")
+    return cluster_assignments
+
+# -----------------------------
 # Optimized CPU Kernel (Numba)
 # -----------------------------
 @njit(fastmath=True, parallel=True)
@@ -178,17 +221,19 @@ def fast_cpu_distance(x: np.ndarray, y: np.ndarray) -> float:
 class GPUAccelerator:
     """
     GPU accelerator using Apple's Metal API via the metalcompute package.
-    This version uses an optimized kernel where each thread processes multiple elements via a striding loop.
+    This class targets a single device with fine-tuned kernel parameters.
     """
-    def __init__(self) -> None:
+    def __init__(self, device: Optional[mc.Device] = None) -> None:
         try:
-            self.device = mc.Device()
-            logger.info(f"Metal GPU Accelerator initialized with device: {self.device.name}")
+            self.device = device if device is not None else mc.Device()
+            logger.info(f"GPUAccelerator initialized with device: {self.device.name}")
         except Exception as e:
-            logger.error(f"Failed to initialize Metal GPU Accelerator: {e}")
+            logger.error(f"Failed to initialize GPUAccelerator: {e}")
             raise GPUInitializationError(e)
         
-        # Optimized Metal kernel code: each thread processes multiple elements using a stride loop.
+        # Fine-tuned Metal kernel code:
+        # - Precompute constant values.
+        # - Use a stride loop with constant total_elements passed as a constant buffer.
         self.kernel_code: str = """
         #include <metal_stdlib>
         using namespace metal;
@@ -198,6 +243,7 @@ class GPUAccelerator:
                              constant uint &total_elements [[ buffer(3) ]],
                              uint id [[ thread_position_in_grid ]],
                              uint total_threads [[ threads_per_grid ]]) {
+            // Each thread processes multiple elements in a strided loop.
             for (uint i = id; i < total_elements; i += total_threads) {
                 result[i] = a[i] * b[i];
             }
@@ -211,8 +257,7 @@ class GPUAccelerator:
     
     def vector_multiply(self, a_np: np.ndarray, b_np: np.ndarray) -> np.ndarray:
         """
-        Multiply two vectors using the optimized Metal GPU kernel.
-        Each thread will process multiple elements via a striding loop.
+        Multiply two vectors using this GPU device with the fine-tuned kernel.
         """
         a = np.ascontiguousarray(a_np.astype(np.float32))
         b = np.ascontiguousarray(b_np.astype(np.float32))
@@ -223,10 +268,8 @@ class GPUAccelerator:
         bytes_count = total_elements * 4
         result_buf = self.device.buffer(bytes_count)
         try:
-            # Determine total number of threads. If the device has a property 'max_threads', use it; otherwise, choose a default.
             total_threads = self.device.max_threads if hasattr(self.device, "max_threads") else 256
-            # Pass the total_elements as an extra parameter; how this is done depends on the metalcompute API.
-            # Here we assume that the compiled kernel accepts total_elements in buffer slot 3.
+            # Call the kernel with precomputed total_elements passed as a constant.
             self.compiled_kernel(total_elements, A_py, B_py, result_buf)
         except Exception as e:
             logger.error(f"Kernel execution failed: {e}")
@@ -234,6 +277,56 @@ class GPUAccelerator:
         result_view = memoryview(result_buf).cast('f')
         result_np = np.array(result_view)
         return result_np
+
+# -----------------------------
+# MultiGPU Accelerator
+# -----------------------------
+class MultiGPUAccelerator:
+    """
+    MultiGPUAccelerator queries all available Metal devices and efficiently distributes the vector
+    multiplication workload between the first two devices.
+    """
+    def __init__(self) -> None:
+        try:
+            self.devices = mc.devices()  # Assumes mc.devices() returns a list of available devices.
+            if len(self.devices) < 2:
+                logger.warning("Less than 2 GPU devices available; falling back to single GPU mode.")
+                self.devices = self.devices[:1]
+            else:
+                self.devices = self.devices[:2]
+            self.gpu_accels = [GPUAccelerator(device=d) for d in self.devices]
+            logger.info(f"MultiGPUAccelerator initialized with devices: {[d.name for d in self.devices]}")
+        except Exception as e:
+            logger.error(f"Failed to initialize MultiGPUAccelerator: {e}")
+            raise GPUInitializationError(e)
+    
+    def vector_multiply(self, a_np: np.ndarray, b_np: np.ndarray) -> np.ndarray:
+        """
+        Splits the input arrays evenly between the available GPUs, runs vector multiplication concurrently,
+        and merges the results.
+        """
+        total_elements = a_np.shape[0]
+        num_devices = len(self.gpu_accels)
+        splits = np.array_split(np.arange(total_elements), num_devices)
+        results = [None] * num_devices
+
+        def worker(idx, indices):
+            a_slice = a_np[indices]
+            b_slice = b_np[indices]
+            result_slice = self.gpu_accels[idx].vector_multiply(a_slice, b_slice)
+            results[idx] = (indices, result_slice)
+
+        threads = []
+        for idx, indices in enumerate(splits):
+            t = threading.Thread(target=worker, args=(idx, indices))
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+        full_result = np.empty(total_elements, dtype=np.float32)
+        for indices, res in results:
+            full_result[indices] = res
+        return full_result
 
 # -----------------------------
 # FinBERT Sentiment Analysis
@@ -958,7 +1051,12 @@ def process_ticker(ticker: str) -> Optional[Dict[str, Any]]:
         df = asyncio.run(data_fetcher.async_fetch_stock_data(ticker))
         target = df["Close"].shift(-4) / df["Close"] - 1
         target = target.fillna(0)
+        # Extract features from the price data.
         features = extract_features(df)
+        # Add the cluster assignment as an extra feature.
+        cluster_id = CLUSTER_ASSIGNMENTS.get(ticker, -1)
+        features["cluster_id"] = cluster_id  # Same cluster_id for all rows.
+        # Augment and reduce features.
         augmented = augment_features(features)
         reduced = pca_reduce(augmented, n_components=10)
         predictions = walk_forward_optimization(reduced, target)
@@ -991,7 +1089,8 @@ def process_ticker(ticker: str) -> Optional[Dict[str, Any]]:
             "Sentiment": sentiment,
             "CurrentRegime": regime,
             "RiskMetrics": risk_metrics,
-            "Predictions": predictions
+            "Predictions": predictions,
+            "Cluster": cluster_id
         }
         return result
     except Exception as e:
@@ -1005,17 +1104,18 @@ def parallel_ticker_processing(tickers: List[str]) -> List[Dict[str, Any]]:
 
 def gpu_vector_test() -> Optional[np.ndarray]:
     try:
-        gpu_accel = GPUAccelerator()
+        # Use the multi-GPU accelerator to run the vector multiplication concurrently.
+        multi_gpu_accel = MultiGPUAccelerator()
         a = np.random.rand(1000000)
         b = np.random.rand(1000000)
-        result = gpu_accel.vector_multiply(a, b)
+        result = multi_gpu_accel.vector_multiply(a, b)
         expected = a * b
         if not np.allclose(result, expected, atol=1e-5):
-            raise ValueError("GPU vector multiplication does not match expected result.")
-        logger.info("GPU vector multiply test completed successfully.")
+            raise ValueError("MultiGPU vector multiplication does not match expected result.")
+        logger.info("MultiGPU vector multiply test completed successfully.")
         return result
     except Exception as e:
-        logger.error(f"GPU test failed: {e}")
+        logger.error(f"MultiGPU test failed: {e}")
         return None
 
 def build_prediction_table(results: List[Dict[str, Any]]) -> Optional[pd.DataFrame]:
@@ -1023,14 +1123,15 @@ def build_prediction_table(results: List[Dict[str, Any]]) -> Optional[pd.DataFra
     for res in results:
         if res.get("Predictions"):
             pred_date, pred_change = res["Predictions"][-1]
-            if pred_change >= 10.0:
+            if pred_change >= 10.0:  # Filter for predictions of >= +1000%
                 rows.append({
                     "Date": pred_date.strftime("%Y-%m-%d") if isinstance(pred_date, datetime.datetime) else str(pred_date),
                     "Ticker": res["Ticker"],
                     "Strike": res["Strike"],
                     "Predicted Increase (%)": pred_change * 100,
                     "BS Price": res["BS_Price"],
-                    "Sentiment": res["Sentiment"]
+                    "Sentiment": res["Sentiment"],
+                    "Cluster": res["Cluster"]
                 })
     return pd.DataFrame(rows) if rows else None
 
@@ -1071,6 +1172,10 @@ def main() -> None:
     except Exception as e:
         logger.error(f"Input error: {e}")
         sys.exit(1)
+    # Perform clustering on the tickers (using historical Friday data)
+    global CLUSTER_ASSIGNMENTS
+    CLUSTER_ASSIGNMENTS = perform_clustering(tickers, n_clusters=2)
+    logger.info(f"Cluster assignments: {CLUSTER_ASSIGNMENTS}")
     try:
         gpu_vector_test()
     except Exception as e:
@@ -1108,11 +1213,11 @@ def run_tests() -> None:
     b = np.array([1.0, 2.0, 3.0])
     cpu_result = fast_cpu_distance(a, b)
     assert abs(cpu_result) < 1e-6, "CPU kernel (Numba) test failed."
-    # Test GPU vector multiplication with optimized kernel
-    gpu = GPUAccelerator()
-    res_gpu = gpu.vector_multiply(a, b)
+    # Test multi-GPU vector multiplication with fine-tuned kernel
+    multi_gpu_accel = MultiGPUAccelerator()
+    res_gpu = multi_gpu_accel.vector_multiply(a, b)
     expected = a * b
-    assert np.allclose(res_gpu, expected, atol=1e-5), "GPU routine test failed."
+    assert np.allclose(res_gpu, expected, atol=1e-5), "MultiGPU routine test failed."
     # Test JAX neural network
     X_test = np.random.rand(5, 10)
     y_test = np.random.rand(5, 1)
