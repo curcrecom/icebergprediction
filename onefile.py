@@ -1,59 +1,43 @@
-import os
-import sys
-import time
-import math
-import json
-import asyncio
-import logging
-import datetime
-import threading
-import argparse
+import os, sys, time, math, json, asyncio, logging, datetime, threading, argparse
 from functools import wraps, partial
-from typing import Any, Dict, Tuple, List, Optional, Callable, Union
+from typing import Any, Dict, Tuple, List, Optional, Callable
 
 import concurrent.futures
 import multiprocessing as mp
-
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from numpy.linalg import svd
 
-# Third-party libraries
+# Third-party libraries with strict requirements
 try:
     from numba import njit, prange
 except ImportError:
     sys.exit("Please install numba (pip install numba)")
-
 try:
     import jax
     import jax.numpy as jnp
     from jax import jit, grad, lax, random
 except ImportError:
     sys.exit("Please install JAX (pip install jax jaxlib)")
-
 try:
     from transformers import pipeline
 except ImportError:
     sys.exit("Please install transformers (pip install transformers)")
-
 try:
     from bayes_opt import BayesianOptimization
 except ImportError:
     sys.exit("Please install bayesian-optimization (pip install bayesian-optimization)")
-
 try:
     import dash
     from dash import dcc, html, Output, Input
     import dash_bootstrap_components as dbc
 except ImportError:
     sys.exit("Please install dash and dash-bootstrap-components (pip install dash dash-bootstrap-components)")
-
 try:
     import metalcompute as mc
 except ImportError:
     sys.exit("Please install metalcompute (pip install metalcompute)")
-
 try:
     from sklearn.cluster import KMeans
 except ImportError:
@@ -64,26 +48,25 @@ except ImportError:
 # -----------------------------
 CACHE_FILE: str = 'data_cache.json'
 LOG_FILE: str = "model_log.txt"
-RUN_DAY: int = 0  # Monday (0)
+RUN_DAY: int = 0  # Monday
 RUN_HOUR: int = 16
-
 CLUSTER_ASSIGNMENTS: Dict[str, int] = {}
 
 # -----------------------------
 # Logger Setup
 # -----------------------------
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(LOG_FILE, mode='w')
+    ]
+)
 logger: logging.Logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-stream_handler = logging.StreamHandler(sys.stdout)
-stream_handler.setFormatter(formatter)
-file_handler = logging.FileHandler(LOG_FILE, mode='w')
-file_handler.setFormatter(formatter)
-logger.addHandler(stream_handler)
-logger.addHandler(file_handler)
 
 # -----------------------------
-# Custom Exception Classes
+# Custom Exceptions
 # -----------------------------
 class NetworkError(Exception):
     pass
@@ -100,7 +83,7 @@ class ModelTrainingError(Exception):
 # -----------------------------
 # Decorators
 # -----------------------------
-def retry(exceptions: Tuple[Exception, ...], tries: int = 3, delay: float = 1, backoff: int = 2) -> Callable:
+def retry(exceptions: Tuple[Exception, ...], tries: int = 3, delay: float = 1.0, backoff: int = 2) -> Callable:
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -109,7 +92,7 @@ def retry(exceptions: Tuple[Exception, ...], tries: int = 3, delay: float = 1, b
                 try:
                     return func(*args, **kwargs)
                 except exceptions as e:
-                    logger.error(f"{func.__name__} failed with {e}, retrying in {mdelay} seconds...")
+                    logger.error(f"{func.__name__} failed with {e}, retrying in {mdelay:.2f} seconds...")
                     time.sleep(mdelay)
                     mtries -= 1
                     mdelay *= backoff
@@ -117,7 +100,7 @@ def retry(exceptions: Tuple[Exception, ...], tries: int = 3, delay: float = 1, b
         return wrapper
     return decorator
 
-def async_retry(exceptions: Tuple[Exception, ...], tries: int = 3, delay: float = 1, backoff: int = 2) -> Callable:
+def async_retry(exceptions: Tuple[Exception, ...], tries: int = 3, delay: float = 1.0, backoff: int = 2) -> Callable:
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         async def wrapper(*args, **kwargs):
@@ -126,7 +109,7 @@ def async_retry(exceptions: Tuple[Exception, ...], tries: int = 3, delay: float 
                 try:
                     return await func(*args, **kwargs)
                 except exceptions as e:
-                    logger.error(f"{func.__name__} (async) failed with {e}, retrying in {mdelay} seconds...")
+                    logger.error(f"{func.__name__} (async) failed with {e}, retrying in {mdelay:.2f} seconds...")
                     await asyncio.sleep(mdelay)
                     mtries -= 1
                     mdelay *= backoff
@@ -139,8 +122,8 @@ def profile(func: Callable) -> Callable:
     def wrapper(*args, **kwargs):
         start = time.perf_counter()
         result = func(*args, **kwargs)
-        end = time.perf_counter()
-        logger.info(f"{func.__name__} took {end - start:.4f} seconds")
+        elapsed = time.perf_counter() - start
+        logger.info(f"{func.__name__} took {elapsed:.4f} seconds")
         return result
     return wrapper
 
@@ -157,35 +140,7 @@ def atomic_save(cache: Dict[str, Any], filename: str) -> None:
         logger.error(f"Error saving cache: {e}")
 
 # -----------------------------
-# Clustering and Transfer Learning Functions
-# -----------------------------
-def perform_clustering(tickers: List[str], n_clusters: int = 2) -> Dict[str, int]:
-    features_list = []
-    valid_tickers = []
-    for ticker in tickers:
-        try:
-            df = yf.Ticker(ticker).history(period='5y')
-            df_friday = df[df.index.weekday == 4]
-            if df_friday.empty:
-                continue
-            df_friday['return'] = df_friday['Close'].pct_change()
-            avg_return = df_friday['return'].mean() if not df_friday['return'].isnull().all() else 0.0
-            std_return = df_friday['return'].std() if not df_friday['return'].isnull().all() else 0.0
-            features_list.append([avg_return, std_return])
-            valid_tickers.append(ticker)
-        except Exception as e:
-            logger.error(f"Clustering: Failed for ticker {ticker}: {e}")
-    if not features_list:
-        return {}
-    X = np.array(features_list)
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-    labels = kmeans.fit_predict(X)
-    cluster_assignments = {ticker: label for ticker, label in zip(valid_tickers, labels)}
-    logger.info(f"Clustering completed. Cluster centers: {kmeans.cluster_centers_}")
-    return cluster_assignments
-
-# -----------------------------
-# Optimized CPU Kernel (Numba)
+# Accelerated Numerical Kernels (Numba)
 # -----------------------------
 @njit(fastmath=True, parallel=True)
 def fast_cpu_distance(x: np.ndarray, y: np.ndarray) -> float:
@@ -195,18 +150,53 @@ def fast_cpu_distance(x: np.ndarray, y: np.ndarray) -> float:
     unroll_factor = 4
     limit = n - (n % unroll_factor)
     for i in range(0, limit, unroll_factor):
-        total += diff[i] * diff[i] + diff[i+1] * diff[i+1] + diff[i+2] * diff[i+2] + diff[i+3] * diff[i+3]
+        total += diff[i] ** 2 + diff[i+1] ** 2 + diff[i+2] ** 2 + diff[i+3] ** 2
     for i in range(limit, n):
-        total += diff[i] * diff[i]
+        total += diff[i] ** 2
     return total
 
+@njit(fastmath=True)
+def binomial_option_unrolled(S: float, K: float, T: float, r: float, sigma: float, N: int, option_type: str) -> float:
+    dt = T / N
+    u = math.exp(sigma * math.sqrt(dt))
+    d = 1.0 / u
+    p = (math.exp(r * dt) - d) / (u - d)
+    asset_prices = np.empty(N + 1, dtype=np.float64)
+    for j in range(N + 1):
+        asset_prices[j] = S * (u ** j) * (d ** (N - j))
+    # Payoff calculation
+    if option_type.lower() == 'call':
+        for j in range(N + 1):
+            asset_prices[j] = max(asset_prices[j] - K, 0.0)
+    else:
+        for j in range(N + 1):
+            asset_prices[j] = max(K - asset_prices[j], 0.0)
+    # Backward induction with unrolling
+    for i in range(N, 0, -1):
+        discount = math.exp(-r * dt)
+        total_steps = i
+        unroll = 4
+        limit = total_steps - (total_steps % unroll)
+        j = 0
+        while j < limit:
+            asset_prices[j] = discount * (p * asset_prices[j + 1] + (1.0 - p) * asset_prices[j])
+            asset_prices[j+1] = discount * (p * asset_prices[j+2] + (1.0 - p) * asset_prices[j+1])
+            asset_prices[j+2] = discount * (p * asset_prices[j+3] + (1.0 - p) * asset_prices[j+2])
+            # Avoid out-of-bound on last element
+            if (j + 3) < total_steps:
+                asset_prices[j+3] = discount * (p * asset_prices[j+4] + (1.0 - p) * asset_prices[j+3])
+            else:
+                asset_prices[j+3] = discount * asset_prices[j+3]
+            j += unroll
+        while j < total_steps:
+            asset_prices[j] = discount * (p * asset_prices[j+1] + (1.0 - p) * asset_prices[j])
+            j += 1
+    return asset_prices[0]
+
 # -----------------------------
-# Optimized GPU Accelerator using Metal (metalcompute)
+# GPU Accelerator using Metal (metalcompute)
 # -----------------------------
 class GPUAccelerator:
-    """
-    GPU accelerator for a single device with a fine-tuned Metal kernel.
-    """
     def __init__(self, device: Optional[mc.Device] = None) -> None:
         try:
             self.device = device if device is not None else mc.Device()
@@ -214,8 +204,7 @@ class GPUAccelerator:
         except Exception as e:
             logger.error(f"Failed to initialize GPUAccelerator: {e}")
             raise GPUInitializationError(e)
-        
-        self.kernel_code: str = """
+        self.kernel_code = """
         #include <metal_stdlib>
         using namespace metal;
         kernel void vec_mult(device const float* a [[ buffer(0) ]],
@@ -245,25 +234,21 @@ class GPUAccelerator:
         bytes_count = total_elements * 4
         result_buf = self.device.buffer(bytes_count)
         try:
-            total_threads = self.device.max_threads if hasattr(self.device, "max_threads") else 256
+            total_threads = getattr(self.device, "max_threads", 256)
             self.compiled_kernel(total_elements, A_py, B_py, result_buf)
         except Exception as e:
             logger.error(f"Kernel execution failed: {e}")
             raise GPUInitializationError(e)
         result_view = memoryview(result_buf).cast('f')
-        result_np = np.array(result_view)
-        return result_np
+        return np.array(result_view)
 
 # -----------------------------
 # MultiGPU Accelerator
 # -----------------------------
 class MultiGPUAccelerator:
-    """
-    Queries available Metal devices and distributes the vector multiplication workload between two devices.
-    """
     def __init__(self) -> None:
         try:
-            self.devices = mc.devices()  # Assumes mc.devices() returns a list of available devices.
+            self.devices = mc.devices()
             if len(self.devices) < 2:
                 logger.warning("Less than 2 GPU devices available; using single GPU mode.")
                 self.devices = self.devices[:1]
@@ -278,29 +263,28 @@ class MultiGPUAccelerator:
     def vector_multiply(self, a_np: np.ndarray, b_np: np.ndarray) -> np.ndarray:
         total_elements = a_np.shape[0]
         num_devices = len(self.gpu_accels)
-        splits = np.array_split(np.arange(total_elements), num_devices)
+        indices = np.array_split(np.arange(total_elements), num_devices)
         results = [None] * num_devices
 
-        def worker(idx, indices):
-            a_slice = a_np[indices]
-            b_slice = b_np[indices]
-            result_slice = self.gpu_accels[idx].vector_multiply(a_slice, b_slice)
-            results[idx] = (indices, result_slice)
+        def worker(idx, inds):
+            a_slice = a_np[inds]
+            b_slice = b_np[inds]
+            results[idx] = (inds, self.gpu_accels[idx].vector_multiply(a_slice, b_slice))
 
         threads = []
-        for idx, indices in enumerate(splits):
-            t = threading.Thread(target=worker, args=(idx, indices))
+        for idx, inds in enumerate(indices):
+            t = threading.Thread(target=worker, args=(idx, inds))
             t.start()
             threads.append(t)
         for t in threads:
             t.join()
         full_result = np.empty(total_elements, dtype=np.float32)
-        for indices, res in results:
-            full_result[indices] = res
+        for inds, res in results:
+            full_result[inds] = res
         return full_result
 
 # -----------------------------
-# FinBERT Sentiment Analysis
+# FinBERT Sentiment Analysis using Transformers
 # -----------------------------
 class SentimentTransformer:
     def __init__(self) -> None:
@@ -311,7 +295,7 @@ class SentimentTransformer:
             logger.info("Loaded FinBERT-based sentiment transformer.")
         except Exception as e:
             logger.error(f"Failed to load FinBERT transformer: {e}")
-            raise
+            raise e
 
     def analyze(self, text: str) -> float:
         result = self.pipeline(text[:512])
@@ -326,7 +310,7 @@ class SentimentTransformer:
         return SentimentTransformer().analyze(text)
 
 # -----------------------------
-# Data Fetching & Caching
+# Data Fetching & Caching with Async I/O
 # -----------------------------
 class DataFetcher:
     def __init__(self, cache_file: str = CACHE_FILE) -> None:
@@ -392,12 +376,12 @@ class DataFetcher:
 # -----------------------------
 # Option Greeks and Pricing
 # -----------------------------
-def calculate_option_greeks(S: float, K: float, T: float, r: float, sigma: float, option_type: str = 'call') -> Tuple[float, float, float, float]:
-    d1 = (math.log(S / K) + (r + sigma**2 / 2) * T) / (sigma * math.sqrt(T) + 1e-12)
+def calculate_option_greeks(S: float, K: float, T: float, r: float, sigma: float) -> Tuple[float, float, float, float]:
+    d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T) + 1e-12)
     d2 = d1 - sigma * math.sqrt(T)
     N = lambda x: 0.5 * (1 + math.erf(x / math.sqrt(2)))
     n = lambda x: math.exp(-0.5 * x**2) / math.sqrt(2 * math.pi)
-    if option_type.lower() == "call":
+    if option_type := "call":
         delta = N(d1)
         theta = (-S * n(d1) * sigma / (2 * math.sqrt(T)) - r * K * math.exp(-r * T) * N(d2))
     else:
@@ -422,12 +406,7 @@ def risk_adjusted_metrics(returns: np.ndarray, benchmark: Optional[np.ndarray] =
     sharpe = np.mean(returns - rf) / (std + 1e-6) if std > 0 else 0.0
     downside = np.std([r for r in returns if r < rf])
     sortino = np.mean(returns - rf) / (downside + 1e-6) if downside > 0 else 0.0
-    if benchmark is not None and benchmark.size > 0:
-        cov = np.cov(returns, benchmark)[0, 1]
-        var_bench = np.var(benchmark)
-        beta = cov / (var_bench + 1e-6)
-    else:
-        beta = 1.0
+    beta = (np.cov(returns, benchmark)[0, 1] / (np.var(benchmark) + 1e-6)) if (benchmark is not None and benchmark.size > 0) else 1.0
     treynor = np.mean(returns - rf) / (beta + 1e-6)
     max_drawdown = np.max(np.maximum.accumulate(returns) - returns)
     calmar = np.mean(returns - rf) / (max_drawdown + 1e-6)
@@ -436,7 +415,7 @@ def risk_adjusted_metrics(returns: np.ndarray, benchmark: Optional[np.ndarray] =
 class OptionPricing:
     @staticmethod
     def black_scholes(S: float, K: float, T: float, r: float, sigma: float, option_type: str = 'call') -> float:
-        d1 = (math.log(S / K) + (r + sigma**2 / 2) * T) / (sigma * math.sqrt(T))
+        d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
         d2 = d1 - sigma * math.sqrt(T)
         N = lambda x: 0.5 * (1 + math.erf(x / math.sqrt(2)))
         if option_type.lower() == 'call':
@@ -444,8 +423,8 @@ class OptionPricing:
         return K * math.exp(-r * T) * N(-d2)
 
     @staticmethod
-    def binomial(S: float, K: float, T: float, r: float, sigma: float, N: int = 100, option_type: str = 'call') -> float:
-        return binomial_option_unrolled(S, K, T, r, sigma, N, option_type)
+    def binomial(S: float, K: float, T: float, r: float, sigma: float, steps: int = 100, option_type: str = 'call') -> float:
+        return binomial_option_unrolled(S, K, T, r, sigma, steps, option_type)
 
     @staticmethod
     def monte_carlo(S: float, K: float, T: float, r: float, sigma: float, simulations: int = 10000, option_type: str = 'call') -> float:
@@ -465,8 +444,8 @@ class OptionPricing:
         return float(jnp.exp(-r * T) * jnp.mean(payoffs))
 
     @staticmethod
-    def jump_diffusion(S: float, K: float, T: float, r: float, sigma: float, lam: float = 0.1,
-                       muJ: float = 0, sigmaJ: float = 0.1, option_type: str = 'call') -> float:
+    def jump_diffusion(S: float, K: float, T: float, r: float, sigma: float,
+                       lam: float = 0.1, muJ: float = 0, sigmaJ: float = 0.1, option_type: str = 'call') -> float:
         price = 0.0
         for k in range(50):
             poisson_prob = math.exp(-lam * T) * (lam * T) ** k / math.factorial(k)
@@ -474,46 +453,8 @@ class OptionPricing:
             price += poisson_prob * OptionPricing.black_scholes(S, K, T, r, sigma_k, option_type)
         return price
 
-@njit(fastmath=True)
-def binomial_option_unrolled(S: float, K: float, T: float, r: float, sigma: float, N: int, option_type: str) -> float:
-    dt = T / N
-    u = math.exp(sigma * math.sqrt(dt))
-    d = 1.0 / u
-    p = (math.exp(r * dt) - d) / (u - d)
-    
-    asset_prices = np.empty(N + 1, dtype=np.float64)
-    for j in range(N + 1):
-        asset_prices[j] = S * (u ** j) * (d ** (N - j))
-    
-    if option_type.lower() == 'call':
-        for j in range(N + 1):
-            asset_prices[j] = asset_prices[j] - K if asset_prices[j] > K else 0.0
-    else:
-        for j in range(N + 1):
-            asset_prices[j] = K - asset_prices[j] if asset_prices[j] < K else 0.0
-
-    unroll_factor = 4
-    for i in range(N, 0, -1):
-        discount = math.exp(-r * dt)
-        total_steps = i
-        limit = total_steps - (total_steps % unroll_factor)
-        j = 0
-        while j < limit:
-            asset_prices[j] = discount * (p * asset_prices[j + 1] + (1.0 - p) * asset_prices[j])
-            asset_prices[j + 1] = discount * (p * asset_prices[j + 2] + (1.0 - p) * asset_prices[j + 1])
-            asset_prices[j + 2] = discount * (p * asset_prices[j + 3] + (1.0 - p) * asset_prices[j + 2])
-            if (j + 4) < total_steps:
-                asset_prices[j + 3] = discount * (p * asset_prices[j + 4] + (1.0 - p) * asset_prices[j + 3])
-            else:
-                asset_prices[j + 3] = discount * (p * asset_prices[j + 3] + (1.0 - p) * asset_prices[j + 3])
-            j += unroll_factor
-        while j < total_steps:
-            asset_prices[j] = discount * (p * asset_prices[j + 1] + (1.0 - p) * asset_prices[j])
-            j += 1
-    return asset_prices[0]
-
 # -----------------------------
-# Technical Indicators
+# Technical Indicators (Vectorized using Pandas/NumPy)
 # -----------------------------
 class TechnicalIndicators:
     @staticmethod
@@ -535,7 +476,7 @@ class TechnicalIndicators:
 
     @staticmethod
     def SSMA(series: pd.Series, period: int) -> pd.Series:
-        return series.rolling(period).mean().ewm(alpha=1 / period, adjust=False).mean()
+        return series.rolling(period).mean().ewm(alpha=1/period, adjust=False).mean()
 
     @staticmethod
     def VWMA(series: pd.Series, volume: pd.Series, period: int) -> pd.Series:
@@ -543,12 +484,12 @@ class TechnicalIndicators:
 
     @staticmethod
     def HMA(series: pd.Series, period: int) -> pd.Series:
-        half = int(period / 2)
-        sqrt = int(np.sqrt(period))
-        wma_half = TechnicalIndicators.WMA(series, half)
+        half_period = max(1, int(period / 2))
+        sqrt_period = max(1, int(np.sqrt(period)))
+        wma_half = TechnicalIndicators.WMA(series, half_period)
         wma_full = TechnicalIndicators.WMA(series, period)
         diff = 2 * wma_half - wma_full
-        return TechnicalIndicators.WMA(diff, sqrt)
+        return TechnicalIndicators.WMA(diff, sqrt_period)
 
     @staticmethod
     def KAMA(series: pd.Series, period: int, fast: int = 2, slow: int = 30) -> pd.Series:
@@ -565,7 +506,7 @@ class TechnicalIndicators:
     def ALMA(series: pd.Series, window: int, offset: float = 0.85, sigma: float = 6) -> pd.Series:
         m = offset * (window - 1)
         s = window / sigma
-        weights = np.array([np.exp(-((i - m) ** 2) / (2 * s * s)) for i in range(window)])
+        weights = np.array([np.exp(-((i - m)**2)/(2*s*s)) for i in range(window)])
         weights /= weights.sum()
         return series.rolling(window).apply(lambda x: np.dot(x, weights), raw=True)
 
@@ -636,7 +577,7 @@ class TechnicalIndicators:
     @staticmethod
     def chaikin_oscillator(df: pd.DataFrame, short_period: int = 3, long_period: int = 10) -> pd.Series:
         ad = ((2 * df['Close'] - df['Low'] - df['High']) / (df['High'] - df['Low'])).fillna(0) * df['Volume']
-        mfm = ((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / (df['High'] - df['Low']).replace(0, np.nan)
+        mfm = ((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / df['High'].sub(df['Low']).replace(0, np.nan)
         adl = (mfm * df['Volume']).cumsum()
         return adl.rolling(short_period).mean() - adl.rolling(long_period).mean()
 
@@ -659,16 +600,14 @@ class HiddenMarkovModel:
         self.pi: np.ndarray = np.full(n_states, 1.0 / n_states)
 
     def _emission_probs(self, observations: np.ndarray) -> np.ndarray:
-        T: int = observations.shape[0]
-        obs = observations.reshape(-1, 1)
         coef = 1.0 / np.sqrt(2 * math.pi * self.vars)
-        exponents = -((obs - self.means) ** 2) / (2 * self.vars)
+        exponents = -((observations.reshape(-1, 1) - self.means) ** 2) / (2 * self.vars)
         return coef * np.exp(exponents)
 
     @profile
     def _fit_single(self, observations: np.ndarray, n_iter: int = 10) -> float:
-        T: int = observations.shape[0]
-        log_likelihood: float = -np.inf
+        T = observations.shape[0]
+        log_likelihood = -np.inf
         for iteration in range(n_iter):
             E = self._emission_probs(observations)
             alpha = np.zeros((T, self.n_states))
@@ -683,7 +622,7 @@ class HiddenMarkovModel:
             beta = np.zeros((T, self.n_states))
             beta[T - 1] = np.ones(self.n_states) / (scale[T - 1] + 1e-12)
             for t in range(T - 2, -1, -1):
-                beta[t] = np.dot(self.trans_mat, (E[t + 1] * beta[t + 1]))
+                beta[t] = np.dot(self.trans_mat, E[t + 1] * beta[t + 1])
                 beta[t] /= (scale[t] + 1e-12)
             gamma = alpha * beta
             gamma /= (gamma.sum(axis=1, keepdims=True) + 1e-12)
@@ -691,13 +630,12 @@ class HiddenMarkovModel:
             denom = num.sum(axis=(1, 2), keepdims=True) + 1e-12
             xi = num / denom
             self.trans_mat = xi.sum(axis=0) / (xi.sum(axis=(0, 2), keepdims=True) + 1e-12)
-            self.trans_mat = self.trans_mat.squeeze()
             gamma_sum = gamma.sum(axis=0)
             self.means = (gamma * observations.reshape(-1, 1)).sum(axis=0) / (gamma_sum + 1e-12)
             self.vars = (gamma * (observations.reshape(-1, 1) - self.means) ** 2).sum(axis=0) / (gamma_sum + 1e-12)
             self.pi = gamma[0]
             log_likelihood = np.sum(np.log(scale + 1e-12))
-            logger.debug(f"HMM Iteration {iteration+1}/{n_iter}, Log Likelihood: {log_likelihood:.4f}")
+            logger.debug(f"HMM Iter {iteration+1}/{n_iter}, Log Likelihood: {log_likelihood:.4f}")
         return log_likelihood
 
     def fit(self, observations: np.ndarray, n_iter: int = 10, parallel: bool = False, n_init: int = 1) -> float:
@@ -713,14 +651,13 @@ class HiddenMarkovModel:
         return self._fit_single(observations, n_iter)
 
     def predict(self, observations: np.ndarray) -> np.ndarray:
-        T: int = observations.shape[0]
-        N: int = self.n_states
+        T = observations.shape[0]
         E = self._emission_probs(observations)
-        delta = np.zeros((T, N))
-        psi = np.zeros((T, N), dtype=int)
+        delta = np.zeros((T, self.n_states))
+        psi = np.zeros((T, self.n_states), dtype=int)
         delta[0] = np.log(self.pi + 1e-12) + np.log(E[0] + 1e-12)
         for t in range(1, T):
-            for j in range(N):
+            for j in range(self.n_states):
                 temp = delta[t - 1] + np.log(self.trans_mat[:, j] + 1e-12)
                 psi[t, j] = np.argmax(temp)
                 delta[t, j] = np.max(temp) + np.log(E[t, j] + 1e-12)
@@ -733,20 +670,13 @@ class HiddenMarkovModel:
 def _fit_instance_hmm(observations: np.ndarray, n_states: int, n_iter: int, seed: int) -> dict:
     model = HiddenMarkovModel(n_states=n_states, seed=seed)
     ll = model._fit_single(observations, n_iter)
-    return {
-        'log_likelihood': ll,
-        'trans_mat': model.trans_mat,
-        'means': model.means,
-        'vars': model.vars,
-        'pi': model.pi
-    }
+    return {'log_likelihood': ll, 'trans_mat': model.trans_mat, 'means': model.means, 'vars': model.vars, 'pi': model.pi}
 
 def fit_parallel_hmm(observations: np.ndarray, n_states: int, n_iter: int = 10, n_init: int = 4) -> HiddenMarkovModel:
-    best_result = None
     best_ll = -np.inf
+    best_result = None
     with concurrent.futures.ProcessPoolExecutor() as executor:
-        futures = [executor.submit(_fit_instance_hmm, observations, n_states, n_iter, seed)
-                   for seed in range(n_init)]
+        futures = [executor.submit(_fit_instance_hmm, observations, n_states, n_iter, seed) for seed in range(n_init)]
         for future in concurrent.futures.as_completed(futures):
             res = future.result()
             if res['log_likelihood'] > best_ll:
@@ -757,7 +687,7 @@ def fit_parallel_hmm(observations: np.ndarray, n_states: int, n_iter: int = 10, 
     best_model.means = best_result['means']
     best_model.vars = best_result['vars']
     best_model.pi = best_result['pi']
-    logger.info(f"Best log likelihood from parallel HMM fits: {best_ll:.4f}")
+    logger.info(f"Best HMM log likelihood from parallel fits: {best_ll:.4f}")
     return best_model
 
 # -----------------------------
@@ -790,16 +720,17 @@ def extract_features(df: pd.DataFrame) -> pd.DataFrame:
     return features.fillna(method="bfill").fillna(method="ffill")
 
 def augment_features(features: pd.DataFrame) -> pd.DataFrame:
-    return features + np.random.normal(0, 0.001, size=features.shape)
+    noise = np.random.normal(0, 0.001, size=features.shape)
+    return features + noise
 
 def pca_reduce(features: pd.DataFrame, n_components: int = 10) -> pd.DataFrame:
-    X = features.values
-    U, s, _ = svd(X - np.mean(X, axis=0), full_matrices=False)
+    X = features.values - np.mean(features.values, axis=0)
+    U, s, _ = svd(X, full_matrices=False)
     X_reduced = U[:, :n_components] * s[:n_components]
     return pd.DataFrame(X_reduced, index=features.index)
 
 # -----------------------------
-# Neural Network with JAX (GPU accelerated)
+# Neural Network with JAX
 # -----------------------------
 class NeuralNetworkJAX:
     def __init__(self,
@@ -813,12 +744,12 @@ class NeuralNetworkJAX:
                  version: str = "v1.0") -> None:
         if hidden_layers is None:
             hidden_layers = [128, 128]
-        self.hidden_layers: List[int] = hidden_layers
-        self.activation_name: str = activation
-        self.learning_rate: float = learning_rate
-        self.dropout_rate: float = dropout_rate
-        self.regularization: float = regularization
-        self.version: str = version
+        self.hidden_layers = hidden_layers
+        self.activation_name = activation
+        self.learning_rate = learning_rate
+        self.dropout_rate = dropout_rate
+        self.regularization = regularization
+        self.version = version
         self.loss_history: List[float] = []
         self.activation_fn: Callable[[jnp.ndarray], jnp.ndarray] = {
             "sin": jnp.sin,
@@ -867,8 +798,7 @@ class NeuralNetworkJAX:
 
     @profile
     def train(self, X: np.ndarray, y: np.ndarray, epochs: int = 100, early_stopping: int = 10) -> List[float]:
-        X_jax = jnp.array(X)
-        y_jax = jnp.array(y)
+        X_jax, y_jax = jnp.array(X), jnp.array(y)
         loss_grad = grad(self.loss)
         best_loss = float("inf")
         early_stop_counter = 0
@@ -895,15 +825,18 @@ class NeuralNetworkJAX:
                     logger.info(f"[JAX] Early stopping triggered at epoch {epoch+1}.")
                     break
         self.params = params
-        import matplotlib.pyplot as plt
-        plt.figure(figsize=(6, 4))
-        plt.plot(self.loss_history, label="JAX Training Loss")
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.title("Neural Network (JAX) Training Loss")
-        plt.legend()
-        plt.savefig("loss_curve_jax.png")
-        plt.close()
+        try:
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(6, 4))
+            plt.plot(self.loss_history, label="JAX Training Loss")
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.title("Neural Network (JAX) Training Loss")
+            plt.legend()
+            plt.savefig("loss_curve_jax.png")
+            plt.close()
+        except Exception as e:
+            logger.error(f"Error plotting loss: {e}")
         return self.loss_history
 
     def predict(self, X: np.ndarray) -> jnp.ndarray:
@@ -911,8 +844,10 @@ class NeuralNetworkJAX:
         return self.forward(X_jax, is_training=False)
 
 # -----------------------------
-# Heston Simulation using JAX (GPU accelerated)
+# Heston Simulation using JAX
 # -----------------------------
+from functools import partial
+
 @partial(jit, static_argnames=['N', 'M'])
 def heston_model_sim_jax(S0: float, v0: float, rho: float, kappa: float, theta: float,
                          sigma: float, r: float, T: float, N: int, M: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
@@ -923,19 +858,15 @@ def heston_model_sim_jax(S0: float, v0: float, rho: float, kappa: float, theta: 
     v = jnp.full((N+1, M), v0)
     key = random.PRNGKey(0)
     Z = random.multivariate_normal(key, mean=mu, cov=cov, shape=(N, M))
-    
     def body(i, carry):
-        S, v = carry
-        S_prev = S[i-1]
-        v_prev = v[i-1]
+        S_prev, v_prev = carry
         dS = (r - 0.5 * v_prev) * dt + jnp.sqrt(v_prev * dt) * Z[i-1, :, 0]
         new_S = S_prev * jnp.exp(dS)
         dv = kappa * (theta - v_prev) * dt + sigma * jnp.sqrt(v_prev * dt) * Z[i-1, :, 1]
         new_v = jnp.maximum(v_prev + dv, 0.0)
-        S = S.at[i].set(new_S)
-        v = v.at[i].set(new_v)
+        S = S_prev.at[i].set(new_S)
+        v = v_prev.at[i].set(new_v)
         return (S, v)
-
     S, v = lax.fori_loop(1, N+1, body, (S, v))
     return S, v
 
@@ -997,7 +928,8 @@ def walk_forward_optimization(features: pd.DataFrame, targets: pd.Series, window
         nn_jax = NeuralNetworkJAX(input_dim=X_train.shape[1], output_dim=1, learning_rate=best_lr)
         nn_jax.train(X_train, y_train, epochs=50, early_stopping=5)
         X_pred = features.iloc[start + window:start + window + 1].values
-        return (features.index[start + window], float(nn_jax.predict(X_pred)[0]))
+        pred_val = float(nn_jax.predict(X_pred)[0])
+        return (features.index[start + window], pred_val)
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = {executor.submit(process_window, start): start for start in range(0, len(features) - window, window)}
         for future in concurrent.futures.as_completed(futures):
@@ -1005,7 +937,7 @@ def walk_forward_optimization(features: pd.DataFrame, targets: pd.Series, window
     return predictions
 
 # -----------------------------
-# Helper: Asynchronous GPU Option Pricing
+# Asynchronous GPU Option Pricing Helper
 # -----------------------------
 async def _fetch_option_prices(latest_close: float, strike: float, T: float, r: float, sigma: float) -> Tuple[float, float, float]:
     bs_task = asyncio.to_thread(OptionPricing.black_scholes, latest_close, strike, T, r, sigma, "call")
@@ -1020,8 +952,7 @@ def process_ticker(ticker: str) -> Optional[Dict[str, Any]]:
     try:
         data_fetcher = DataFetcher()
         df = asyncio.run(data_fetcher.async_fetch_stock_data(ticker))
-        target = df["Close"].shift(-4) / df["Close"] - 1
-        target = target.fillna(0)
+        target = (df["Close"].shift(-4) / df["Close"] - 1).fillna(0)
         features = extract_features(df)
         cluster_id = CLUSTER_ASSIGNMENTS.get(ticker, -1)
         features["cluster_id"] = cluster_id
@@ -1033,10 +964,8 @@ def process_ticker(ticker: str) -> Optional[Dict[str, Any]]:
         r_val = 0.01
         T_val = 4 / 252
         sigma_val = np.std(np.log(df["Close"] / df["Close"].shift(1)).dropna()) * math.sqrt(252)
-        # Launch GPU option pricing concurrently while CPU continues its work.
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as gpu_executor:
             gpu_future = gpu_executor.submit(lambda: asyncio.run(_fetch_option_prices(latest_close, strike, T_val, r_val, sigma_val)))
-            # Meanwhile, compute CPU-based risk metrics, HMM fitting, etc.
             delta, gamma, theta, vega = calculate_option_greeks(latest_close, strike, T_val, r_val, sigma_val)
             sentiment = asyncio.run(data_fetcher.fetch_news_sentiment(ticker))
             returns = np.log(df["Close"] / df["Close"].shift(1)).dropna().values
@@ -1044,10 +973,9 @@ def process_ticker(ticker: str) -> Optional[Dict[str, Any]]:
             risk_metrics = {"RiskMetrics": risk_adjusted_metrics(returns, benchmark=benchmark_returns)}
             hmm = HiddenMarkovModel(n_states=2)
             hmm.fit(returns, n_iter=10, parallel=True, n_init=4)
-            regimes = hmm.predict(returns)
-            regime = regimes[-1]
+            regime = hmm.predict(returns)[-1]
             bs_price, binom_price, mc_price = gpu_future.result()
-        result = {
+        return {
             "Ticker": ticker,
             "LatestClose": latest_close,
             "Strike": strike,
@@ -1064,7 +992,6 @@ def process_ticker(ticker: str) -> Optional[Dict[str, Any]]:
             "Predictions": predictions,
             "Cluster": cluster_id
         }
-        return result
     except Exception as e:
         logger.error(f"Error processing ticker {ticker}: {e}")
         return None
@@ -1080,10 +1007,9 @@ def gpu_vector_test() -> Optional[np.ndarray]:
         a = np.random.rand(1000000)
         b = np.random.rand(1000000)
         result = multi_gpu_accel.vector_multiply(a, b)
-        expected = a * b
-        if not np.allclose(result, expected, atol=1e-5):
-            raise ValueError("MultiGPU vector multiplication does not match expected result.")
-        logger.info("MultiGPU vector multiply test completed successfully.")
+        if not np.allclose(result, a * b, atol=1e-5):
+            raise ValueError("MultiGPU vector multiplication mismatch.")
+        logger.info("MultiGPU vector multiply test passed.")
         return result
     except Exception as e:
         logger.error(f"MultiGPU test failed: {e}")
@@ -1107,21 +1033,24 @@ def build_prediction_table(results: List[Dict[str, Any]]) -> Optional[pd.DataFra
     return pd.DataFrame(rows) if rows else None
 
 def plot_performance_metrics(results: List[Dict[str, Any]]) -> None:
-    tickers = [res["Ticker"] for res in results if res is not None]
-    sentiments = [res["Sentiment"] for res in results if res is not None]
-    bs_prices = [res["BS_Price"] for res in results if res is not None]
-    import matplotlib.pyplot as plt
-    plt.figure(figsize=(8, 6))
-    plt.scatter(sentiments, bs_prices, c="blue")
-    plt.xlabel("News Sentiment")
-    plt.ylabel("Black–Scholes Price")
-    plt.title("Performance Metrics per Ticker")
-    plt.grid(True)
-    plt.savefig("performance_metrics.png")
-    plt.show()
+    tickers = [res["Ticker"] for res in results if res]
+    sentiments = [res["Sentiment"] for res in results if res]
+    bs_prices = [res["BS_Price"] for res in results if res]
+    try:
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(8, 6))
+        plt.scatter(sentiments, bs_prices, c="blue")
+        plt.xlabel("News Sentiment")
+        plt.ylabel("Black–Scholes Price")
+        plt.title("Performance Metrics per Ticker")
+        plt.grid(True)
+        plt.savefig("performance_metrics.png")
+        plt.show()
+    except Exception as e:
+        logger.error(f"Error plotting performance metrics: {e}")
 
 # -----------------------------
-# Main Execution
+# Main Execution Function
 # -----------------------------
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -1133,7 +1062,7 @@ def main() -> None:
 
     now = datetime.datetime.now()
     if now.weekday() != RUN_DAY or now.hour < RUN_HOUR:
-        logger.error("This script is designed to run at Monday close (after 16:00). Exiting.")
+        logger.error("This script is designed to run at Monday after 16:00. Exiting.")
         sys.exit(1)
     try:
         tickers_input = input("Enter tickers (comma separated): ")
@@ -1145,31 +1074,28 @@ def main() -> None:
         logger.error(f"Input error: {e}")
         sys.exit(1)
 
-    # Run CPU-bound tasks first: clustering, feature extraction, HMM fitting, NN training.
     global CLUSTER_ASSIGNMENTS
     CLUSTER_ASSIGNMENTS = perform_clustering(tickers, n_clusters=2)
     logger.info(f"Cluster assignments: {CLUSTER_ASSIGNMENTS}")
 
     results = parallel_ticker_processing(tickers)
     if not results:
-        logger.info("No predictions generated due to data or market conditions.")
+        logger.info("No predictions generated.")
         return
 
-    # Meanwhile, GPU tasks are offloaded concurrently within each ticker’s processing (see process_ticker)
     try:
         gpu_vector_test()
     except Exception as e:
-        logger.error(f"GPU acceleration test failed: {e}")
+        logger.error(f"GPU test failed: {e}")
 
     prediction_table = build_prediction_table(results)
     if prediction_table is not None and not prediction_table.empty:
         print("\nPrediction Table:")
         print(prediction_table.to_string(index=False))
     else:
-        print("No call option price increase predictions meeting the threshold were found.")
+        print("No significant predictions found.")
 
     plot_performance_metrics(results)
-
     avg_bs = np.mean([res["BS_Price"] for res in results if "BS_Price" in res])
     avg_sent = np.mean([res["Sentiment"] for res in results if "Sentiment" in res])
     metrics_data = {"avg_bs": avg_bs, "avg_sent": avg_sent}
@@ -1185,26 +1111,33 @@ def main() -> None:
 # Unit and Integration Tests
 # -----------------------------
 def run_tests() -> None:
-    import matplotlib.pyplot as plt
     logger.info("Running unit tests...")
+    # Test Numba accelerated distance
     a = np.array([1.0, 2.0, 3.0])
     b = np.array([1.0, 2.0, 3.0])
     cpu_result = fast_cpu_distance(a, b)
-    assert abs(cpu_result) < 1e-6, "CPU kernel (Numba) test failed."
+    assert abs(cpu_result) < 1e-6, "fast_cpu_distance test failed."
+    
+    # Test MultiGPU vector multiply
     multi_gpu_accel = MultiGPUAccelerator()
     res_gpu = multi_gpu_accel.vector_multiply(a, b)
-    expected = a * b
-    assert np.allclose(res_gpu, expected, atol=1e-5), "MultiGPU routine test failed."
+    assert np.allclose(res_gpu, a * b, atol=1e-5), "MultiGPU routine test failed."
+
+    # Test NeuralNetworkJAX gradients
     X_test = np.random.rand(5, 10)
     y_test = np.random.rand(5, 1)
     nn_jax = NeuralNetworkJAX(input_dim=10, output_dim=1, dropout_rate=0.2, activation="relu")
     l_val = nn_jax.loss(nn_jax.params, jnp.array(X_test), jnp.array(y_test))
     g = grad(nn_jax.loss)(nn_jax.params, jnp.array(X_test), jnp.array(y_test))
     for key in nn_jax.params:
-        assert key in g, f"Missing gradient for {key}"
+        assert key in g, f"Gradient for {key} missing."
+    
+    # Test sentiment transformer
     st = SentimentTransformer()
     score = st.analyze("This is a great day for trading!")
     assert isinstance(score, float), "Sentiment transformer test failed."
+    
+    # Test feature extraction
     df_sample = pd.DataFrame({
         "Close": np.linspace(100, 110, 30),
         "Volume": np.random.randint(1000, 5000, 30),
@@ -1213,6 +1146,8 @@ def run_tests() -> None:
     }, index=pd.date_range("2020-01-01", periods=30))
     feats = extract_features(df_sample)
     assert not feats.empty, "Feature extraction test failed."
+
+    # Test retry decorator
     call_counter = {"count": 0}
     @retry(Exception, tries=3, delay=0.1, backoff=1)
     def test_retry_success():
@@ -1221,16 +1156,42 @@ def run_tests() -> None:
             raise ValueError("Failing")
         return "succeeded"
     assert test_retry_success() == "succeeded", "Retry decorator test failed."
+
     @profile
     def dummy_sleep():
         time.sleep(0.2)
         return "done"
-    result = dummy_sleep()
-    assert result == "done", "Profiling decorator test failed."
+    assert dummy_sleep() == "done", "Profiling decorator test failed."
+
     sample_ticker = "AAPL"
     result = process_ticker(sample_ticker)
-    assert result is not None, "Integration test for process_ticker failed."
-    logger.info("All unit and integration tests passed.")
+    assert result is not None, "process_ticker integration test failed."
+
+    logger.info("All tests passed.")
+
+def perform_clustering(tickers: List[str], n_clusters: int = 2) -> Dict[str, int]:
+    features_list = []
+    valid_tickers = []
+    for ticker in tickers:
+        try:
+            df = yf.Ticker(ticker).history(period='5y')
+            df_friday = df[df.index.weekday == 4]
+            if df_friday.empty:
+                continue
+            df_friday['return'] = df_friday['Close'].pct_change()
+            avg_return = df_friday['return'].mean() if not df_friday['return'].isnull().all() else 0.0
+            std_return = df_friday['return'].std() if not df_friday['return'].isnull().all() else 0.0
+            features_list.append([avg_return, std_return])
+            valid_tickers.append(ticker)
+        except Exception as e:
+            logger.error(f"Clustering failed for ticker {ticker}: {e}")
+    if not features_list:
+        return {}
+    X = np.array(features_list)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    labels = kmeans.fit_predict(X)
+    logger.info(f"Clustering completed. Centers: {kmeans.cluster_centers_}")
+    return {ticker: label for ticker, label in zip(valid_tickers, labels)}
 
 if __name__ == "__main__":
     main()
