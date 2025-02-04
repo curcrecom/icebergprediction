@@ -1,4 +1,13 @@
-import os, sys, time, math, json, asyncio, logging, datetime, threading, argparse
+import os
+import sys
+import time
+import math
+import json
+import asyncio
+import logging
+import datetime
+import threading
+import argparse
 from functools import wraps, partial
 from typing import Any, Dict, Tuple, List, Optional, Callable
 
@@ -20,6 +29,10 @@ try:
     from jax import jit, grad, lax, random
 except ImportError:
     sys.exit("Please install JAX (pip install jax jaxlib)")
+try:
+    import optax
+except ImportError:
+    sys.exit("Please install optax (pip install optax)")
 try:
     from transformers import pipeline
 except ImportError:
@@ -44,13 +57,16 @@ except ImportError:
     sys.exit("Please install scikit-learn (pip install scikit-learn)")
 
 # -----------------------------
-# Global Configuration
+# Configuration
 # -----------------------------
-CACHE_FILE: str = 'data_cache.json'
-LOG_FILE: str = "model_log.txt"
-RUN_DAY: int = 0  # Monday
-RUN_HOUR: int = 16
-CLUSTER_ASSIGNMENTS: Dict[str, int] = {}
+CONFIG = {
+    "CACHE_FILE": "data_cache.json",
+    "LOG_FILE": "model_log.txt",
+    "RUN_DAY": 0,         # Monday
+    "RUN_HOUR": 16,       # 16:00 local time
+    "CLUSTER_ASSIGNMENTS": {},
+    "DASH_PORT": 8050,    # Configurable dashboard port
+}
 
 # -----------------------------
 # Logger Setup
@@ -60,7 +76,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(LOG_FILE, mode='w')
+        logging.FileHandler(CONFIG["LOG_FILE"], mode='w')
     ]
 )
 logger: logging.Logger = logging.getLogger(__name__)
@@ -84,6 +100,7 @@ class ModelTrainingError(Exception):
 # Decorators
 # -----------------------------
 def retry(exceptions: Tuple[Exception, ...], tries: int = 3, delay: float = 1.0, backoff: int = 2) -> Callable:
+    @wraps(func := lambda *args, **kwargs: None)
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -139,6 +156,9 @@ def atomic_save(cache: Dict[str, Any], filename: str) -> None:
     except Exception as e:
         logger.error(f"Error saving cache: {e}")
 
+def run_async(coro: Callable) -> Any:
+    return asyncio.run(coro)
+
 # -----------------------------
 # Accelerated Numerical Kernels (Numba)
 # -----------------------------
@@ -164,14 +184,12 @@ def binomial_option_unrolled(S: float, K: float, T: float, r: float, sigma: floa
     asset_prices = np.empty(N + 1, dtype=np.float64)
     for j in range(N + 1):
         asset_prices[j] = S * (u ** j) * (d ** (N - j))
-    # Payoff calculation
     if option_type.lower() == 'call':
         for j in range(N + 1):
             asset_prices[j] = max(asset_prices[j] - K, 0.0)
     else:
         for j in range(N + 1):
             asset_prices[j] = max(K - asset_prices[j], 0.0)
-    # Backward induction with unrolling
     for i in range(N, 0, -1):
         discount = math.exp(-r * dt)
         total_steps = i
@@ -182,7 +200,6 @@ def binomial_option_unrolled(S: float, K: float, T: float, r: float, sigma: floa
             asset_prices[j] = discount * (p * asset_prices[j + 1] + (1.0 - p) * asset_prices[j])
             asset_prices[j+1] = discount * (p * asset_prices[j+2] + (1.0 - p) * asset_prices[j+1])
             asset_prices[j+2] = discount * (p * asset_prices[j+3] + (1.0 - p) * asset_prices[j+2])
-            # Avoid out-of-bound on last element
             if (j + 3) < total_steps:
                 asset_prices[j+3] = discount * (p * asset_prices[j+4] + (1.0 - p) * asset_prices[j+3])
             else:
@@ -313,7 +330,7 @@ class SentimentTransformer:
 # Data Fetching & Caching with Async I/O
 # -----------------------------
 class DataFetcher:
-    def __init__(self, cache_file: str = CACHE_FILE) -> None:
+    def __init__(self, cache_file: str = CONFIG["CACHE_FILE"]) -> None:
         self.cache_file: str = cache_file
         self.cache: Dict[str, Any] = {}
         if os.path.exists(cache_file):
@@ -381,12 +398,8 @@ def calculate_option_greeks(S: float, K: float, T: float, r: float, sigma: float
     d2 = d1 - sigma * math.sqrt(T)
     N = lambda x: 0.5 * (1 + math.erf(x / math.sqrt(2)))
     n = lambda x: math.exp(-0.5 * x**2) / math.sqrt(2 * math.pi)
-    if option_type := "call":
-        delta = N(d1)
-        theta = (-S * n(d1) * sigma / (2 * math.sqrt(T)) - r * K * math.exp(-r * T) * N(d2))
-    else:
-        delta = N(d1) - 1
-        theta = (-S * n(d1) * sigma / (2 * math.sqrt(T)) + r * K * math.exp(-r * T) * N(-d2))
+    delta = N(d1)
+    theta = (-S * n(d1) * sigma / (2 * math.sqrt(T)) - r * K * math.exp(-r * T) * N(d2))
     gamma = n(d1) / (S * sigma * math.sqrt(T) + 1e-12)
     vega = S * math.sqrt(T) * n(d1)
     return delta, gamma, theta, vega
@@ -437,7 +450,8 @@ class OptionPricing:
     @staticmethod
     def monte_carlo_gpu(S: float, K: float, T: float, r: float, sigma: float, simulations: int = 10000, option_type: str = 'call') -> float:
         dt = T
-        key = random.PRNGKey(int(time.time()))
+        seed = int(np.random.randint(0, 100000))
+        key = random.PRNGKey(seed)
         rand = random.normal(key, shape=(simulations,))
         ST = S * jnp.exp((r - 0.5 * sigma**2)*dt + sigma * jnp.sqrt(dt) * rand)
         payoffs = jnp.where(option_type.lower()=='call', jnp.maximum(ST - K, 0), jnp.maximum(K - ST, 0))
@@ -730,7 +744,7 @@ def pca_reduce(features: pd.DataFrame, n_components: int = 10) -> pd.DataFrame:
     return pd.DataFrame(X_reduced, index=features.index)
 
 # -----------------------------
-# Neural Network with JAX
+# Neural Network with JAX using Optax
 # -----------------------------
 class NeuralNetworkJAX:
     def __init__(self,
@@ -769,6 +783,9 @@ class NeuralNetworkJAX:
             f"b{i+1}": jnp.array(np.zeros(layers[i+1]))
             for i in range(len(layers) - 1)
         })
+        # Initialize the optax optimizer (Adam)
+        self.optimizer = optax.adam(self.learning_rate)
+        self.opt_state = self.optimizer.init(self.params)
 
     def forward(self, X: jnp.ndarray, params: Optional[Dict[str, jnp.ndarray]] = None,
                 dropout_key: Optional[jnp.ndarray] = None, is_training: bool = True) -> jnp.ndarray:
@@ -799,22 +816,19 @@ class NeuralNetworkJAX:
     @profile
     def train(self, X: np.ndarray, y: np.ndarray, epochs: int = 100, early_stopping: int = 10) -> List[float]:
         X_jax, y_jax = jnp.array(X), jnp.array(y)
-        loss_grad = grad(self.loss)
+
+        @jax.jit
+        def train_step(params, opt_state, X_jax, y_jax):
+            loss_value, grads = jax.value_and_grad(self.loss)(params, X_jax, y_jax)
+            updates, opt_state = self.optimizer.update(grads, opt_state)
+            new_params = optax.apply_updates(params, updates)
+            return new_params, opt_state, loss_value
+
         best_loss = float("inf")
         early_stop_counter = 0
-        params = self.params
 
-        @jit
-        def update_params(params, X_jax, y_jax, key):
-            l = self.loss(params, X_jax, y_jax)
-            grads = loss_grad(params, X_jax, y_jax)
-            new_params = {k: params[k] - self.learning_rate * grads[k] for k in params}
-            return new_params, l
-
-        key = random.PRNGKey(int(time.time()))
         for epoch in range(epochs):
-            key, subkey = random.split(key)
-            params, l = update_params(params, X_jax, y_jax, subkey)
+            self.params, self.opt_state, l = train_step(self.params, self.opt_state, X_jax, y_jax)
             self.loss_history.append(float(l))
             if l < best_loss:
                 best_loss = l
@@ -822,18 +836,18 @@ class NeuralNetworkJAX:
             else:
                 early_stop_counter += 1
                 if early_stop_counter >= early_stopping:
-                    logger.info(f"[JAX] Early stopping triggered at epoch {epoch+1}.")
+                    logger.info(f"[JAX/Optax] Early stopping triggered at epoch {epoch+1}.")
                     break
-        self.params = params
+
         try:
             import matplotlib.pyplot as plt
             plt.figure(figsize=(6, 4))
-            plt.plot(self.loss_history, label="JAX Training Loss")
+            plt.plot(self.loss_history, label="JAX/Optax Training Loss")
             plt.xlabel("Epoch")
             plt.ylabel("Loss")
-            plt.title("Neural Network (JAX) Training Loss")
+            plt.title("Neural Network (JAX/Optax) Training Loss")
             plt.legend()
-            plt.savefig("loss_curve_jax.png")
+            plt.savefig("loss_curve_jax_optax.png")
             plt.close()
         except Exception as e:
             logger.error(f"Error plotting loss: {e}")
@@ -897,8 +911,8 @@ def start_dashboard(metrics_data: Dict[str, Any]) -> None:
     def update_metrics(n):
         return (str(metrics_data.get("avg_bs", "N/A")), str(metrics_data.get("avg_sent", "N/A")))
     
-    threading.Thread(target=app.run_server, kwargs={'port':8050}, daemon=True).start()
-    logger.info("Dashboard started at http://127.0.0.1:8050")
+    threading.Thread(target=app.run_server, kwargs={'port': CONFIG["DASH_PORT"], 'debug': False}, daemon=True).start()
+    logger.info(f"Dashboard started at http://127.0.0.1:{CONFIG['DASH_PORT']}")
 
 # -----------------------------
 # Optimization Functions
@@ -951,10 +965,10 @@ async def _fetch_option_prices(latest_close: float, strike: float, T: float, r: 
 def process_ticker(ticker: str) -> Optional[Dict[str, Any]]:
     try:
         data_fetcher = DataFetcher()
-        df = asyncio.run(data_fetcher.async_fetch_stock_data(ticker))
+        df = run_async(data_fetcher.async_fetch_stock_data(ticker))
         target = (df["Close"].shift(-4) / df["Close"] - 1).fillna(0)
         features = extract_features(df)
-        cluster_id = CLUSTER_ASSIGNMENTS.get(ticker, -1)
+        cluster_id = CONFIG["CLUSTER_ASSIGNMENTS"].get(ticker, -1)
         features["cluster_id"] = cluster_id
         augmented = augment_features(features)
         reduced = pca_reduce(augmented, n_components=10)
@@ -965,9 +979,9 @@ def process_ticker(ticker: str) -> Optional[Dict[str, Any]]:
         T_val = 4 / 252
         sigma_val = np.std(np.log(df["Close"] / df["Close"].shift(1)).dropna()) * math.sqrt(252)
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as gpu_executor:
-            gpu_future = gpu_executor.submit(lambda: asyncio.run(_fetch_option_prices(latest_close, strike, T_val, r_val, sigma_val)))
+            gpu_future = gpu_executor.submit(lambda: run_async(_fetch_option_prices(latest_close, strike, T_val, r_val, sigma_val)))
             delta, gamma, theta, vega = calculate_option_greeks(latest_close, strike, T_val, r_val, sigma_val)
-            sentiment = asyncio.run(data_fetcher.fetch_news_sentiment(ticker))
+            sentiment = run_async(data_fetcher.fetch_news_sentiment(ticker))
             returns = np.log(df["Close"] / df["Close"].shift(1)).dropna().values
             benchmark_returns = get_benchmark_returns(start=str(df.index[0].date()), end=str(df.index[-1].date()))
             risk_metrics = {"RiskMetrics": risk_adjusted_metrics(returns, benchmark=benchmark_returns)}
@@ -1045,7 +1059,7 @@ def plot_performance_metrics(results: List[Dict[str, Any]]) -> None:
         plt.title("Performance Metrics per Ticker")
         plt.grid(True)
         plt.savefig("performance_metrics.png")
-        plt.show()
+        plt.close()
     except Exception as e:
         logger.error(f"Error plotting performance metrics: {e}")
 
@@ -1055,28 +1069,33 @@ def plot_performance_metrics(results: List[Dict[str, Any]]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--test", action="store_true", help="Run unit tests and exit")
+    parser.add_argument("--tickers", type=str, help="Comma-separated tickers")
     args = parser.parse_args()
     if args.test:
         run_tests()
         return
 
     now = datetime.datetime.now()
-    if now.weekday() != RUN_DAY or now.hour < RUN_HOUR:
-        logger.error("This script is designed to run at Monday after 16:00. Exiting.")
-        sys.exit(1)
-    try:
-        tickers_input = input("Enter tickers (comma separated): ")
-        tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
-        if not tickers:
-            logger.error("No tickers provided. Exiting.")
-            sys.exit(1)
-    except Exception as e:
-        logger.error(f"Input error: {e}")
+    if now.weekday() != CONFIG["RUN_DAY"] or now.hour < CONFIG["RUN_HOUR"]:
+        logger.error("This script is designed to run on Monday after 16:00. Exiting.")
         sys.exit(1)
 
-    global CLUSTER_ASSIGNMENTS
-    CLUSTER_ASSIGNMENTS = perform_clustering(tickers, n_clusters=2)
-    logger.info(f"Cluster assignments: {CLUSTER_ASSIGNMENTS}")
+    if args.tickers:
+        tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
+    else:
+        try:
+            tickers_input = input("Enter tickers (comma separated): ")
+            tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+        except Exception as e:
+            logger.error(f"Input error: {e}")
+            sys.exit(1)
+    if not tickers:
+        logger.error("No tickers provided. Exiting.")
+        sys.exit(1)
+
+    global CONFIG
+    CONFIG["CLUSTER_ASSIGNMENTS"] = perform_clustering(tickers, n_clusters=2)
+    logger.info(f"Cluster assignments: {CONFIG['CLUSTER_ASSIGNMENTS']}")
 
     results = parallel_ticker_processing(tickers)
     if not results:
@@ -1112,18 +1131,15 @@ def main() -> None:
 # -----------------------------
 def run_tests() -> None:
     logger.info("Running unit tests...")
-    # Test Numba accelerated distance
     a = np.array([1.0, 2.0, 3.0])
     b = np.array([1.0, 2.0, 3.0])
     cpu_result = fast_cpu_distance(a, b)
     assert abs(cpu_result) < 1e-6, "fast_cpu_distance test failed."
     
-    # Test MultiGPU vector multiply
     multi_gpu_accel = MultiGPUAccelerator()
     res_gpu = multi_gpu_accel.vector_multiply(a, b)
     assert np.allclose(res_gpu, a * b, atol=1e-5), "MultiGPU routine test failed."
 
-    # Test NeuralNetworkJAX gradients
     X_test = np.random.rand(5, 10)
     y_test = np.random.rand(5, 1)
     nn_jax = NeuralNetworkJAX(input_dim=10, output_dim=1, dropout_rate=0.2, activation="relu")
@@ -1132,12 +1148,10 @@ def run_tests() -> None:
     for key in nn_jax.params:
         assert key in g, f"Gradient for {key} missing."
     
-    # Test sentiment transformer
     st = SentimentTransformer()
     score = st.analyze("This is a great day for trading!")
     assert isinstance(score, float), "Sentiment transformer test failed."
     
-    # Test feature extraction
     df_sample = pd.DataFrame({
         "Close": np.linspace(100, 110, 30),
         "Volume": np.random.randint(1000, 5000, 30),
@@ -1147,7 +1161,6 @@ def run_tests() -> None:
     feats = extract_features(df_sample)
     assert not feats.empty, "Feature extraction test failed."
 
-    # Test retry decorator
     call_counter = {"count": 0}
     @retry(Exception, tries=3, delay=0.1, backoff=1)
     def test_retry_success():
