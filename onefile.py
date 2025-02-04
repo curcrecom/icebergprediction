@@ -54,7 +54,6 @@ try:
 except ImportError:
     sys.exit("Please install metalcompute (pip install metalcompute)")
 
-# New: Import scikit-learn's KMeans for clustering.
 try:
     from sklearn.cluster import KMeans
 except ImportError:
@@ -68,7 +67,6 @@ LOG_FILE: str = "model_log.txt"
 RUN_DAY: int = 0  # Monday (0)
 RUN_HOUR: int = 16
 
-# Global dictionary to hold cluster assignments for tickers.
 CLUSTER_ASSIGNMENTS: Dict[str, int] = {}
 
 # -----------------------------
@@ -88,19 +86,15 @@ logger.addHandler(file_handler)
 # Custom Exception Classes
 # -----------------------------
 class NetworkError(Exception):
-    """Exception raised for network-related errors."""
     pass
 
 class DataFetchError(Exception):
-    """Exception raised when data fetching fails."""
     pass
 
 class GPUInitializationError(Exception):
-    """Exception raised when GPU accelerator initialization fails."""
     pass
 
 class ModelTrainingError(Exception):
-    """Exception raised during model training errors."""
     pass
 
 # -----------------------------
@@ -166,17 +160,11 @@ def atomic_save(cache: Dict[str, Any], filename: str) -> None:
 # Clustering and Transfer Learning Functions
 # -----------------------------
 def perform_clustering(tickers: List[str], n_clusters: int = 2) -> Dict[str, int]:
-    """
-    For each ticker, fetch historical data over the last 5 years and compute clustering features.
-    Here we use average Friday return and standard deviation of Friday returns as features.
-    Returns a dictionary mapping ticker -> cluster label.
-    """
     features_list = []
     valid_tickers = []
     for ticker in tickers:
         try:
             df = yf.Ticker(ticker).history(period='5y')
-            # Filter for Fridays (weekday == 4)
             df_friday = df[df.index.weekday == 4]
             if df_friday.empty:
                 continue
@@ -201,9 +189,6 @@ def perform_clustering(tickers: List[str], n_clusters: int = 2) -> Dict[str, int
 # -----------------------------
 @njit(fastmath=True, parallel=True)
 def fast_cpu_distance(x: np.ndarray, y: np.ndarray) -> float:
-    """
-    Calculate the squared distance between two arrays using vectorized operations and manual loop unrolling.
-    """
     diff = x - y
     total = 0.0
     n = diff.shape[0]
@@ -220,8 +205,7 @@ def fast_cpu_distance(x: np.ndarray, y: np.ndarray) -> float:
 # -----------------------------
 class GPUAccelerator:
     """
-    GPU accelerator using Apple's Metal API via the metalcompute package.
-    This class targets a single device with fine-tuned kernel parameters.
+    GPU accelerator for a single device with a fine-tuned Metal kernel.
     """
     def __init__(self, device: Optional[mc.Device] = None) -> None:
         try:
@@ -231,9 +215,6 @@ class GPUAccelerator:
             logger.error(f"Failed to initialize GPUAccelerator: {e}")
             raise GPUInitializationError(e)
         
-        # Fine-tuned Metal kernel code:
-        # - Precompute constant values.
-        # - Use a stride loop with constant total_elements passed as a constant buffer.
         self.kernel_code: str = """
         #include <metal_stdlib>
         using namespace metal;
@@ -243,7 +224,6 @@ class GPUAccelerator:
                              constant uint &total_elements [[ buffer(3) ]],
                              uint id [[ thread_position_in_grid ]],
                              uint total_threads [[ threads_per_grid ]]) {
-            // Each thread processes multiple elements in a strided loop.
             for (uint i = id; i < total_elements; i += total_threads) {
                 result[i] = a[i] * b[i];
             }
@@ -256,9 +236,6 @@ class GPUAccelerator:
             raise GPUInitializationError(e)
     
     def vector_multiply(self, a_np: np.ndarray, b_np: np.ndarray) -> np.ndarray:
-        """
-        Multiply two vectors using this GPU device with the fine-tuned kernel.
-        """
         a = np.ascontiguousarray(a_np.astype(np.float32))
         b = np.ascontiguousarray(b_np.astype(np.float32))
         total_elements = a.shape[0]
@@ -269,7 +246,6 @@ class GPUAccelerator:
         result_buf = self.device.buffer(bytes_count)
         try:
             total_threads = self.device.max_threads if hasattr(self.device, "max_threads") else 256
-            # Call the kernel with precomputed total_elements passed as a constant.
             self.compiled_kernel(total_elements, A_py, B_py, result_buf)
         except Exception as e:
             logger.error(f"Kernel execution failed: {e}")
@@ -283,28 +259,23 @@ class GPUAccelerator:
 # -----------------------------
 class MultiGPUAccelerator:
     """
-    MultiGPUAccelerator queries all available Metal devices and efficiently distributes the vector
-    multiplication workload between the first two devices.
+    Queries available Metal devices and distributes the vector multiplication workload between two devices.
     """
     def __init__(self) -> None:
         try:
             self.devices = mc.devices()  # Assumes mc.devices() returns a list of available devices.
             if len(self.devices) < 2:
-                logger.warning("Less than 2 GPU devices available; falling back to single GPU mode.")
+                logger.warning("Less than 2 GPU devices available; using single GPU mode.")
                 self.devices = self.devices[:1]
             else:
                 self.devices = self.devices[:2]
             self.gpu_accels = [GPUAccelerator(device=d) for d in self.devices]
-            logger.info(f"MultiGPUAccelerator initialized with devices: {[d.name for d in self.devices]}")
+            logger.info(f"MultiGPUAccelerator using devices: {[d.name for d in self.devices]}")
         except Exception as e:
             logger.error(f"Failed to initialize MultiGPUAccelerator: {e}")
             raise GPUInitializationError(e)
     
     def vector_multiply(self, a_np: np.ndarray, b_np: np.ndarray) -> np.ndarray:
-        """
-        Splits the input arrays evenly between the available GPUs, runs vector multiplication concurrently,
-        and merges the results.
-        """
         total_elements = a_np.shape[0]
         num_devices = len(self.gpu_accels)
         splits = np.array_split(np.arange(total_elements), num_devices)
@@ -1051,12 +1022,9 @@ def process_ticker(ticker: str) -> Optional[Dict[str, Any]]:
         df = asyncio.run(data_fetcher.async_fetch_stock_data(ticker))
         target = df["Close"].shift(-4) / df["Close"] - 1
         target = target.fillna(0)
-        # Extract features from the price data.
         features = extract_features(df)
-        # Add the cluster assignment as an extra feature.
         cluster_id = CLUSTER_ASSIGNMENTS.get(ticker, -1)
-        features["cluster_id"] = cluster_id  # Same cluster_id for all rows.
-        # Augment and reduce features.
+        features["cluster_id"] = cluster_id
         augmented = augment_features(features)
         reduced = pca_reduce(augmented, n_components=10)
         predictions = walk_forward_optimization(reduced, target)
@@ -1065,16 +1033,20 @@ def process_ticker(ticker: str) -> Optional[Dict[str, Any]]:
         r_val = 0.01
         T_val = 4 / 252
         sigma_val = np.std(np.log(df["Close"] / df["Close"].shift(1)).dropna()) * math.sqrt(252)
-        bs_price, binom_price, mc_price = asyncio.run(_fetch_option_prices(latest_close, strike, T_val, r_val, sigma_val))
-        delta, gamma, theta, vega = calculate_option_greeks(latest_close, strike, T_val, r_val, sigma_val)
-        sentiment = asyncio.run(data_fetcher.fetch_news_sentiment(ticker))
-        returns = np.log(df["Close"] / df["Close"].shift(1)).dropna().values
-        benchmark_returns = get_benchmark_returns(start=str(df.index[0].date()), end=str(df.index[-1].date()))
-        risk_metrics = {"RiskMetrics": risk_adjusted_metrics(returns, benchmark=benchmark_returns)}
-        hmm = HiddenMarkovModel(n_states=2)
-        hmm.fit(returns, n_iter=10, parallel=True, n_init=4)
-        regimes = hmm.predict(returns)
-        regime = regimes[-1]
+        # Launch GPU option pricing concurrently while CPU continues its work.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as gpu_executor:
+            gpu_future = gpu_executor.submit(lambda: asyncio.run(_fetch_option_prices(latest_close, strike, T_val, r_val, sigma_val)))
+            # Meanwhile, compute CPU-based risk metrics, HMM fitting, etc.
+            delta, gamma, theta, vega = calculate_option_greeks(latest_close, strike, T_val, r_val, sigma_val)
+            sentiment = asyncio.run(data_fetcher.fetch_news_sentiment(ticker))
+            returns = np.log(df["Close"] / df["Close"].shift(1)).dropna().values
+            benchmark_returns = get_benchmark_returns(start=str(df.index[0].date()), end=str(df.index[-1].date()))
+            risk_metrics = {"RiskMetrics": risk_adjusted_metrics(returns, benchmark=benchmark_returns)}
+            hmm = HiddenMarkovModel(n_states=2)
+            hmm.fit(returns, n_iter=10, parallel=True, n_init=4)
+            regimes = hmm.predict(returns)
+            regime = regimes[-1]
+            bs_price, binom_price, mc_price = gpu_future.result()
         result = {
             "Ticker": ticker,
             "LatestClose": latest_close,
@@ -1104,7 +1076,6 @@ def parallel_ticker_processing(tickers: List[str]) -> List[Dict[str, Any]]:
 
 def gpu_vector_test() -> Optional[np.ndarray]:
     try:
-        # Use the multi-GPU accelerator to run the vector multiplication concurrently.
         multi_gpu_accel = MultiGPUAccelerator()
         a = np.random.rand(1000000)
         b = np.random.rand(1000000)
@@ -1123,7 +1094,7 @@ def build_prediction_table(results: List[Dict[str, Any]]) -> Optional[pd.DataFra
     for res in results:
         if res.get("Predictions"):
             pred_date, pred_change = res["Predictions"][-1]
-            if pred_change >= 10.0:  # Filter for predictions of >= +1000%
+            if pred_change >= 10.0:
                 rows.append({
                     "Date": pred_date.strftime("%Y-%m-%d") if isinstance(pred_date, datetime.datetime) else str(pred_date),
                     "Ticker": res["Ticker"],
@@ -1159,6 +1130,7 @@ def main() -> None:
     if args.test:
         run_tests()
         return
+
     now = datetime.datetime.now()
     if now.weekday() != RUN_DAY or now.hour < RUN_HOUR:
         logger.error("This script is designed to run at Monday close (after 16:00). Exiting.")
@@ -1172,25 +1144,32 @@ def main() -> None:
     except Exception as e:
         logger.error(f"Input error: {e}")
         sys.exit(1)
-    # Perform clustering on the tickers (using historical Friday data)
+
+    # Run CPU-bound tasks first: clustering, feature extraction, HMM fitting, NN training.
     global CLUSTER_ASSIGNMENTS
     CLUSTER_ASSIGNMENTS = perform_clustering(tickers, n_clusters=2)
     logger.info(f"Cluster assignments: {CLUSTER_ASSIGNMENTS}")
-    try:
-        gpu_vector_test()
-    except Exception as e:
-        logger.error(f"GPU acceleration test failed: {e}")
+
     results = parallel_ticker_processing(tickers)
     if not results:
         logger.info("No predictions generated due to data or market conditions.")
         return
+
+    # Meanwhile, GPU tasks are offloaded concurrently within each ticker’s processing (see process_ticker)
+    try:
+        gpu_vector_test()
+    except Exception as e:
+        logger.error(f"GPU acceleration test failed: {e}")
+
     prediction_table = build_prediction_table(results)
     if prediction_table is not None and not prediction_table.empty:
         print("\nPrediction Table:")
         print(prediction_table.to_string(index=False))
     else:
         print("No call option price increase predictions meeting the threshold were found.")
+
     plot_performance_metrics(results)
+
     avg_bs = np.mean([res["BS_Price"] for res in results if "BS_Price" in res])
     avg_sent = np.mean([res["Sentiment"] for res in results if "Sentiment" in res])
     metrics_data = {"avg_bs": avg_bs, "avg_sent": avg_sent}
@@ -1208,17 +1187,14 @@ def main() -> None:
 def run_tests() -> None:
     import matplotlib.pyplot as plt
     logger.info("Running unit tests...")
-    # Test optimized CPU distance
     a = np.array([1.0, 2.0, 3.0])
     b = np.array([1.0, 2.0, 3.0])
     cpu_result = fast_cpu_distance(a, b)
     assert abs(cpu_result) < 1e-6, "CPU kernel (Numba) test failed."
-    # Test multi-GPU vector multiplication with fine-tuned kernel
     multi_gpu_accel = MultiGPUAccelerator()
     res_gpu = multi_gpu_accel.vector_multiply(a, b)
     expected = a * b
     assert np.allclose(res_gpu, expected, atol=1e-5), "MultiGPU routine test failed."
-    # Test JAX neural network
     X_test = np.random.rand(5, 10)
     y_test = np.random.rand(5, 1)
     nn_jax = NeuralNetworkJAX(input_dim=10, output_dim=1, dropout_rate=0.2, activation="relu")
@@ -1226,11 +1202,9 @@ def run_tests() -> None:
     g = grad(nn_jax.loss)(nn_jax.params, jnp.array(X_test), jnp.array(y_test))
     for key in nn_jax.params:
         assert key in g, f"Missing gradient for {key}"
-    # Test sentiment transformer
     st = SentimentTransformer()
     score = st.analyze("This is a great day for trading!")
     assert isinstance(score, float), "Sentiment transformer test failed."
-    # Test feature extraction
     df_sample = pd.DataFrame({
         "Close": np.linspace(100, 110, 30),
         "Volume": np.random.randint(1000, 5000, 30),
@@ -1239,7 +1213,6 @@ def run_tests() -> None:
     }, index=pd.date_range("2020-01-01", periods=30))
     feats = extract_features(df_sample)
     assert not feats.empty, "Feature extraction test failed."
-    # Test retry decorator
     call_counter = {"count": 0}
     @retry(Exception, tries=3, delay=0.1, backoff=1)
     def test_retry_success():
@@ -1248,14 +1221,12 @@ def run_tests() -> None:
             raise ValueError("Failing")
         return "succeeded"
     assert test_retry_success() == "succeeded", "Retry decorator test failed."
-    # Test profiling decorator
     @profile
     def dummy_sleep():
         time.sleep(0.2)
         return "done"
     result = dummy_sleep()
     assert result == "done", "Profiling decorator test failed."
-    # Integration test for ticker processing
     sample_ticker = "AAPL"
     result = process_ticker(sample_ticker)
     assert result is not None, "Integration test for process_ticker failed."
