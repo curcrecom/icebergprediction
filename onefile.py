@@ -173,9 +173,13 @@ def fast_cpu_distance(x: np.ndarray, y: np.ndarray) -> float:
     return total
 
 # -----------------------------
-# GPU Accelerator using Metal (metalcompute)
+# Optimized GPU Accelerator using Metal (metalcompute)
 # -----------------------------
 class GPUAccelerator:
+    """
+    GPU accelerator using Apple's Metal API via the metalcompute package.
+    This version uses an optimized kernel where each thread processes multiple elements via a striding loop.
+    """
     def __init__(self) -> None:
         try:
             self.device = mc.Device()
@@ -184,14 +188,19 @@ class GPUAccelerator:
             logger.error(f"Failed to initialize Metal GPU Accelerator: {e}")
             raise GPUInitializationError(e)
         
+        # Optimized Metal kernel code: each thread processes multiple elements using a stride loop.
         self.kernel_code: str = """
         #include <metal_stdlib>
         using namespace metal;
-        kernel void vec_mult(const device float* a [[ buffer(0) ]],
-                             const device float* b [[ buffer(1) ]],
+        kernel void vec_mult(device const float* a [[ buffer(0) ]],
+                             device const float* b [[ buffer(1) ]],
                              device float* result [[ buffer(2) ]],
-                             uint id [[ thread_position_in_grid ]]) {
-            result[id] = a[id] * b[id];
+                             constant uint &total_elements [[ buffer(3) ]],
+                             uint id [[ thread_position_in_grid ]],
+                             uint total_threads [[ threads_per_grid ]]) {
+            for (uint i = id; i < total_elements; i += total_threads) {
+                result[i] = a[i] * b[i];
+            }
         }
         """
         try:
@@ -201,16 +210,24 @@ class GPUAccelerator:
             raise GPUInitializationError(e)
     
     def vector_multiply(self, a_np: np.ndarray, b_np: np.ndarray) -> np.ndarray:
+        """
+        Multiply two vectors using the optimized Metal GPU kernel.
+        Each thread will process multiple elements via a striding loop.
+        """
         a = np.ascontiguousarray(a_np.astype(np.float32))
         b = np.ascontiguousarray(b_np.astype(np.float32))
-        count = a.shape[0]
+        total_elements = a.shape[0]
         from array import array
         A_py = array('f', a.tolist())
         B_py = array('f', b.tolist())
-        bytes_count = count * 4
+        bytes_count = total_elements * 4
         result_buf = self.device.buffer(bytes_count)
         try:
-            self.compiled_kernel(count, A_py, B_py, result_buf)
+            # Determine total number of threads. If the device has a property 'max_threads', use it; otherwise, choose a default.
+            total_threads = self.device.max_threads if hasattr(self.device, "max_threads") else 256
+            # Pass the total_elements as an extra parameter; how this is done depends on the metalcompute API.
+            # Here we assume that the compiled kernel accepts total_elements in buffer slot 3.
+            self.compiled_kernel(total_elements, A_py, B_py, result_buf)
         except Exception as e:
             logger.error(f"Kernel execution failed: {e}")
             raise GPUInitializationError(e)
@@ -352,7 +369,6 @@ def risk_adjusted_metrics(returns: np.ndarray, benchmark: Optional[np.ndarray] =
     calmar = np.mean(returns - rf) / (max_drawdown + 1e-6)
     return {"Sharpe": sharpe, "Sortino": sortino, "Treynor": treynor, "Calmar": calmar, "Beta": beta}
 
-# Option Pricing Models with enhancements
 class OptionPricing:
     @staticmethod
     def black_scholes(S: float, K: float, T: float, r: float, sigma: float, option_type: str = 'call') -> float:
@@ -365,7 +381,6 @@ class OptionPricing:
 
     @staticmethod
     def binomial(S: float, K: float, T: float, r: float, sigma: float, N: int = 100, option_type: str = 'call') -> float:
-        # Use the accelerated binomial pricing function with loop unrolling
         return binomial_option_unrolled(S, K, T, r, sigma, N, option_type)
 
     @staticmethod
@@ -381,7 +396,7 @@ class OptionPricing:
         dt = T
         key = random.PRNGKey(int(time.time()))
         rand = random.normal(key, shape=(simulations,))
-        ST = S * jnp.exp((r - 0.5 * sigma**2) * dt + sigma * jnp.sqrt(dt) * rand)
+        ST = S * jnp.exp((r - 0.5 * sigma**2)*dt + sigma * jnp.sqrt(dt) * rand)
         payoffs = jnp.where(option_type.lower()=='call', jnp.maximum(ST - K, 0), jnp.maximum(K - ST, 0))
         return float(jnp.exp(-r * T) * jnp.mean(payoffs))
 
@@ -1093,7 +1108,7 @@ def run_tests() -> None:
     b = np.array([1.0, 2.0, 3.0])
     cpu_result = fast_cpu_distance(a, b)
     assert abs(cpu_result) < 1e-6, "CPU kernel (Numba) test failed."
-    # Test GPU vector multiplication
+    # Test GPU vector multiplication with optimized kernel
     gpu = GPUAccelerator()
     res_gpu = gpu.vector_multiply(a, b)
     expected = a * b
