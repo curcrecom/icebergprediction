@@ -383,7 +383,7 @@ def risk_adjusted_metrics(returns: np.ndarray, benchmark: Optional[np.ndarray] =
 
 class OptionPricing:
     """
-    Option pricing models including Black–Scholes, Binomial, Monte Carlo, and Jump Diffusion.
+    Option pricing models including Black–Scholes, Binomial, Monte Carlo (CPU) and a GPU-accelerated Monte Carlo.
     """
     @staticmethod
     def black_scholes(S: float, K: float, T: float, r: float, sigma: float, option_type: str = 'call') -> float:
@@ -413,6 +413,19 @@ class OptionPricing:
         ST = S * np.exp((r - 0.5 * sigma**2) * dt + sigma * math.sqrt(dt) * rand)
         payoffs = np.maximum(ST - K, 0) if option_type.lower() == 'call' else np.maximum(K - ST, 0)
         return math.exp(-r * T) * np.mean(payoffs)
+
+    @staticmethod
+    def monte_carlo_gpu(S: float, K: float, T: float, r: float, sigma: float, simulations: int = 10000, option_type: str = 'call') -> float:
+        """
+        GPU-accelerated Monte Carlo simulation using JAX.
+        """
+        dt = T
+        key = random.PRNGKey(int(time.time()))
+        rand = random.normal(key, shape=(simulations,))
+        ST = S * jnp.exp((r - 0.5 * sigma**2)*dt + sigma * jnp.sqrt(dt) * rand)
+        # Use jnp.where for vectorized branch selection
+        payoffs = jnp.where(option_type.lower()=='call', jnp.maximum(ST - K, 0), jnp.maximum(K - ST, 0))
+        return float(jnp.exp(-r * T) * jnp.mean(payoffs))
 
     @staticmethod
     def jump_diffusion(S: float, K: float, T: float, r: float, sigma: float, lam: float = 0.1,
@@ -724,7 +737,7 @@ def pca_reduce(features: pd.DataFrame, n_components: int = 10) -> pd.DataFrame:
     return pd.DataFrame(X_reduced, index=features.index)
 
 # -----------------------------
-# Neural Network with JAX
+# Neural Network with JAX (GPU accelerated)
 # -----------------------------
 class NeuralNetworkJAX:
     """
@@ -847,7 +860,7 @@ class NeuralNetworkJAX:
         return self.forward(X_jax, is_training=False)
 
 # -----------------------------
-# Heston Simulation using JAX
+# Heston Simulation using JAX (GPU accelerated)
 # -----------------------------
 @partial(jit, static_argnames=['N', 'M'])
 def heston_model_sim_jax(S0: float, v0: float, rho: float, kappa: float, theta: float,
@@ -934,18 +947,35 @@ def advanced_bayesian_optimization_lr(X_train: np.ndarray, y_train: np.ndarray, 
 def walk_forward_optimization(features: pd.DataFrame, targets: pd.Series, window: int = 100) -> List[Tuple[Any, float]]:
     """
     Walk-forward optimization: train the model on rolling windows and generate predictions.
+    Parallelize the window processing using a ThreadPoolExecutor.
     """
     predictions: List[Tuple[Any, float]] = []
-    for start in range(0, len(features) - window, window):
+    def process_window(start):
         X_train = features.iloc[start:start + window].values
         y_train = targets.iloc[start:start + window].values.reshape(-1, 1)
         best_lr, _ = advanced_bayesian_optimization_lr(X_train, y_train, n_iter=5)
         nn_jax = NeuralNetworkJAX(input_dim=X_train.shape[1], output_dim=1, learning_rate=best_lr)
         nn_jax.train(X_train, y_train, epochs=50, early_stopping=5)
         X_pred = features.iloc[start + window:start + window + 1].values
-        pred = nn_jax.predict(X_pred)
-        predictions.append((features.index[start + window], float(pred[0])))
+        return (features.index[start + window], float(nn_jax.predict(X_pred)[0]))
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = {executor.submit(process_window, start): start for start in range(0, len(features) - window, window)}
+        for future in concurrent.futures.as_completed(futures):
+            predictions.append(future.result())
     return predictions
+
+# -----------------------------
+# Helper: Asynchronous GPU Option Pricing
+# -----------------------------
+async def _fetch_option_prices(latest_close: float, strike: float, T: float, r: float, sigma: float) -> Tuple[float, float, float]:
+    """
+    Concurrently compute option prices using GPU-accelerated or parallelized functions.
+    Offload the work to separate threads.
+    """
+    bs_task = asyncio.to_thread(OptionPricing.black_scholes, latest_close, strike, T, r, sigma, "call")
+    binom_task = asyncio.to_thread(OptionPricing.binomial, latest_close, strike, T, r, sigma, 100, "call")
+    mc_task = asyncio.to_thread(OptionPricing.monte_carlo_gpu, latest_close, strike, T, r, sigma, 10000, "call")
+    return await asyncio.gather(bs_task, binom_task, mc_task)
 
 # -----------------------------
 # Ticker Processing Functions
@@ -953,6 +983,7 @@ def walk_forward_optimization(features: pd.DataFrame, targets: pd.Series, window
 def process_ticker(ticker: str) -> Optional[Dict[str, Any]]:
     """
     Process a single ticker: fetch data, extract features, run predictions, price options, and compute risk metrics.
+    GPU-accelerated computations (such as the Monte Carlo simulation) are offloaded concurrently.
     """
     try:
         data_fetcher = DataFetcher()
@@ -968,9 +999,8 @@ def process_ticker(ticker: str) -> Optional[Dict[str, Any]]:
         r = 0.01
         T = 4 / 252
         sigma = np.std(np.log(df["Close"] / df["Close"].shift(1)).dropna()) * math.sqrt(252)
-        bs_price = OptionPricing.black_scholes(latest_close, strike, T, r, sigma, option_type="call")
-        binom_price = OptionPricing.binomial(latest_close, strike, T, r, sigma, N=100, option_type="call")
-        mc_price = OptionPricing.monte_carlo(latest_close, strike, T, r, sigma, simulations=10000, option_type="call")
+        # Offload option pricing concurrently (using GPU-accelerated monte_carlo_gpu)
+        bs_price, binom_price, mc_price = asyncio.run(_fetch_option_prices(latest_close, strike, T, r, sigma))
         delta, gamma, theta, vega = calculate_option_greeks(latest_close, strike, T, r, sigma)
         sentiment = asyncio.run(data_fetcher.fetch_news_sentiment(ticker))
         returns = np.log(df["Close"] / df["Close"].shift(1)).dropna().values
