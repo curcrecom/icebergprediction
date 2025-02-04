@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-"""
-An integrated quantitative trading framework using multi-threading, async I/O, GPU acceleration, 
-Bayesian optimization, and more. 
-Author: (Your Name)
-Date: (Current Date)
-"""
-
 import os
 import sys
 import time
