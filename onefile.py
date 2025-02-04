@@ -1,3 +1,11 @@
+#!/usr/bin/env python3
+"""
+An integrated quantitative trading framework using multi-threading, async I/O, GPU acceleration, 
+Bayesian optimization, and more. 
+Author: (Your Name)
+Date: (Current Date)
+"""
+
 import os
 import sys
 import time
@@ -9,7 +17,6 @@ import datetime
 import threading
 import argparse
 import io
-
 from functools import wraps, partial
 from typing import Any, Dict, Tuple, List, Optional, Callable
 
@@ -22,7 +29,7 @@ from numpy.linalg import svd
 
 # Third-party libraries with strict requirements
 try:
-    from numba import njit, prange
+    from numba import njit, prange, cuda
 except ImportError:
     sys.exit("Please install numba (pip install numba)")
 try:
@@ -58,7 +65,7 @@ try:
 except ImportError:
     sys.exit("Please install hdbscan (pip install hdbscan)")
 try:
-    from sklearn.cluster import KMeans  # Still kept for other uses if needed.
+    from sklearn.cluster import KMeans  # Kept for other uses if needed.
 except ImportError:
     sys.exit("Please install scikit-learn (pip install scikit-learn)")
 try:
@@ -67,12 +74,18 @@ try:
 except ImportError:
     sys.exit("Please install dask (pip install dask)")
 
+# Additional missing import for asynchronous HTTP calls
+try:
+    import aiohttp
+except ImportError:
+    sys.exit("Please install aiohttp (pip install aiohttp)")
+
 from logging.handlers import RotatingFileHandler
 
 # -----------------------------
 # Configuration
 # -----------------------------
-CONFIG = {
+CONFIG: Dict[str, Any] = {
     "CACHE_FILE": "data_cache.json",
     "LOG_FILE": "model_log.txt",
     "RUN_DAY": 0,         # Monday
@@ -105,21 +118,28 @@ logger.addHandler(fh)
 # Custom Exceptions
 # -----------------------------
 class NetworkError(Exception):
+    """Exception for network-related errors."""
     pass
 
 class DataFetchError(Exception):
+    """Exception raised when data fetching fails."""
     pass
 
 class GPUInitializationError(Exception):
+    """Exception raised when GPU initialization fails."""
     pass
 
 class ModelTrainingError(Exception):
+    """Exception raised during model training failures."""
     pass
 
 # -----------------------------
 # Decorators
 # -----------------------------
 def retry(exceptions: Tuple[Exception, ...], tries: int = 3, delay: float = 1.0, backoff: int = 2) -> Callable:
+    """
+    Retry decorator for synchronous functions.
+    """
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -137,6 +157,9 @@ def retry(exceptions: Tuple[Exception, ...], tries: int = 3, delay: float = 1.0,
     return decorator
 
 def async_retry(exceptions: Tuple[Exception, ...], tries: int = 3, delay: float = 1.0, backoff: int = 2) -> Callable:
+    """
+    Retry decorator for asynchronous functions.
+    """
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         async def wrapper(*args, **kwargs):
@@ -154,6 +177,9 @@ def async_retry(exceptions: Tuple[Exception, ...], tries: int = 3, delay: float 
     return decorator
 
 def profile(func: Callable) -> Callable:
+    """
+    Simple profiling decorator that logs the execution time of the function.
+    """
     @wraps(func)
     def wrapper(*args, **kwargs):
         start = time.perf_counter()
@@ -167,15 +193,21 @@ def profile(func: Callable) -> Callable:
 # Utility Functions
 # -----------------------------
 def atomic_save(cache: Dict[str, Any], filename: str) -> None:
+    """
+    Atomically save a JSON cache to file.
+    """
     temp_filename = filename + ".tmp"
     try:
         with open(temp_filename, 'w') as f:
             json.dump(cache, f)
         os.replace(temp_filename, filename)
     except Exception as e:
-        logger.error(f"Error saving cache: {e}")
+        logger.exception(f"Error saving cache: {e}")
 
 def run_async(coro: Callable) -> Any:
+    """
+    Run an asynchronous coroutine.
+    """
     return asyncio.run(coro)
 
 # -----------------------------
@@ -183,6 +215,9 @@ def run_async(coro: Callable) -> Any:
 # -----------------------------
 @njit(fastmath=True, parallel=True)
 def fast_cpu_distance(x: np.ndarray, y: np.ndarray) -> float:
+    """
+    Compute squared Euclidean distance between x and y using loop unrolling.
+    """
     diff = x - y
     total = 0.0
     n = diff.shape[0]
@@ -196,6 +231,9 @@ def fast_cpu_distance(x: np.ndarray, y: np.ndarray) -> float:
 
 @njit(fastmath=True)
 def binomial_option_unrolled(S: float, K: float, T: float, r: float, sigma: float, N: int, option_type: str) -> float:
+    """
+    Compute option price using an unrolled binomial tree.
+    """
     dt = T / N
     u = math.exp(sigma * math.sqrt(dt))
     d = 1.0 / u
@@ -233,12 +271,15 @@ def binomial_option_unrolled(S: float, K: float, T: float, r: float, sigma: floa
 # GPU Accelerator using Metal (metalcompute)
 # -----------------------------
 class GPUAccelerator:
+    """
+    GPU Accelerator using metalcompute. Initializes a GPU device and compiles a vector multiplication kernel.
+    """
     def __init__(self, device: Optional[mc.Device] = None) -> None:
         try:
             self.device = device if device is not None else mc.Device()
             logger.info(f"GPUAccelerator initialized with device: {self.device.name}")
         except Exception as e:
-            logger.error(f"Failed to initialize GPUAccelerator: {e}")
+            logger.exception("Failed to initialize GPUAccelerator")
             raise GPUInitializationError(e)
         self.kernel_code = """
         #include <metal_stdlib>
@@ -257,23 +298,33 @@ class GPUAccelerator:
         try:
             self.compiled_kernel = self.device.kernel(self.kernel_code).function("vec_mult")
         except Exception as e:
-            logger.error(f"Kernel compilation failed: {e}")
+            logger.exception("Kernel compilation failed")
             raise GPUInitializationError(e)
     
     def vector_multiply(self, a_np: np.ndarray, b_np: np.ndarray) -> np.ndarray:
-        a = np.ascontiguousarray(a_np.astype(np.float32))
-        b = np.ascontiguousarray(b_np.astype(np.float32))
-        total_elements = a.shape[0]
-        from array import array
-        A_py = array('f', a.tolist())
-        B_py = array('f', b.tolist())
+        """
+        Multiply two vectors using the GPU.
+        """
+        a_np = np.ascontiguousarray(a_np.astype(np.float32))
+        b_np = np.ascontiguousarray(b_np.astype(np.float32))
+        total_elements = a_np.shape[0]
+        # Use array.tobytes() if metalcompute supports it; otherwise fallback to list conversion
+        try:
+            # If metalcompute accepts memoryview, use that for speed
+            a_bytes = memoryview(a_np)
+            b_bytes = memoryview(b_np)
+        except Exception:
+            from array import array
+            a_bytes = array('f', a_np.tolist())
+            b_bytes = array('f', b_np.tolist())
         bytes_count = total_elements * 4
         result_buf = self.device.buffer(bytes_count)
         try:
             total_threads = getattr(self.device, "max_threads", 256)
-            self.compiled_kernel(total_elements, A_py, B_py, result_buf)
+            # Pass total_elements and buffers to the compiled kernel.
+            self.compiled_kernel(total_elements, a_bytes, b_bytes, result_buf)
         except Exception as e:
-            logger.error(f"Kernel execution failed: {e}")
+            logger.exception("Kernel execution failed")
             raise GPUInitializationError(e)
         result_view = memoryview(result_buf).cast('f')
         return np.array(result_view)
@@ -282,6 +333,9 @@ class GPUAccelerator:
 # MultiGPU Accelerator
 # -----------------------------
 class MultiGPUAccelerator:
+    """
+    Uses multiple GPU devices (if available) to perform vector multiplication in parallel.
+    """
     def __init__(self) -> None:
         try:
             self.devices = mc.devices()
@@ -293,16 +347,19 @@ class MultiGPUAccelerator:
             self.gpu_accels = [GPUAccelerator(device=d) for d in self.devices]
             logger.info(f"MultiGPUAccelerator using devices: {[d.name for d in self.devices]}")
         except Exception as e:
-            logger.error(f"Failed to initialize MultiGPUAccelerator: {e}")
+            logger.exception("Failed to initialize MultiGPUAccelerator")
             raise GPUInitializationError(e)
     
     def vector_multiply(self, a_np: np.ndarray, b_np: np.ndarray) -> np.ndarray:
+        """
+        Split the input arrays and run vector multiplication on available GPU devices.
+        """
         total_elements = a_np.shape[0]
         num_devices = len(self.gpu_accels)
         indices = np.array_split(np.arange(total_elements), num_devices)
         results = [None] * num_devices
 
-        def worker(idx, inds):
+        def worker(idx: int, inds: np.ndarray):
             a_slice = a_np[inds]
             b_slice = b_np[inds]
             results[idx] = (inds, self.gpu_accels[idx].vector_multiply(a_slice, b_slice))
@@ -323,6 +380,9 @@ class MultiGPUAccelerator:
 # FinBERT Sentiment Analysis using Transformers
 # -----------------------------
 class SentimentTransformer:
+    """
+    A simple sentiment analysis wrapper based on FinBERT.
+    """
     def __init__(self) -> None:
         try:
             self.pipeline = pipeline("sentiment-analysis",
@@ -330,10 +390,14 @@ class SentimentTransformer:
                                      tokenizer="yiyanghkust/finbert-pretrain")
             logger.info("Loaded FinBERT-based sentiment transformer.")
         except Exception as e:
-            logger.error(f"Failed to load FinBERT transformer: {e}")
+            logger.exception("Failed to load FinBERT transformer")
             raise e
 
     def analyze(self, text: str) -> float:
+        """
+        Analyze sentiment in the text. Positive sentiment returns a positive score,
+        negative sentiment returns a negative score.
+        """
         result = self.pipeline(text[:512])
         if result and result[0]['label'].upper() == "POSITIVE":
             return result[0]['score']
@@ -349,6 +413,9 @@ class SentimentTransformer:
 # Data Fetching & Caching with Async I/O using aiohttp and Cache Expiry
 # -----------------------------
 class DataFetcher:
+    """
+    Asynchronously fetches stock data and news sentiment; uses local caching to avoid redundant calls.
+    """
     def __init__(self, cache_file: str = CONFIG["CACHE_FILE"]) -> None:
         self.cache_file: str = cache_file
         self.cache: Dict[str, Any] = {}
@@ -357,7 +424,7 @@ class DataFetcher:
                 with open(cache_file, 'r') as f:
                     self.cache = json.load(f)
             except Exception as e:
-                logger.error(f"Error loading cache: {e}")
+                logger.exception(f"Error loading cache: {e}")
                 self.cache = {}
         self._sentiment_transformer: Optional[SentimentTransformer] = None
 
@@ -366,7 +433,9 @@ class DataFetcher:
 
     @retry((DataFetchError, Exception), tries=3, delay=2, backoff=2)
     async def async_fetch_stock_data(self, ticker: str, period: str = '5y') -> pd.DataFrame:
-        # Check if cached and not expired
+        """
+        Asynchronously fetch stock data from Yahoo Finance and cache it.
+        """
         current_time = time.time()
         if ticker in self.cache:
             entry = self.cache[ticker]
@@ -376,10 +445,10 @@ class DataFetcher:
                     df = pd.read_json(entry["data"], convert_dates=True)
                     return df
                 except Exception as e:
-                    logger.error(f"Error reading cache for {ticker}: {e}")
+                    logger.exception(f"Error reading cache for {ticker}: {e}")
             else:
                 logger.info(f"Cache expired for ticker: {ticker}")
-        # Compute date range based on period (assume '5y')
+        # Compute date range based on 5y period
         end_date = datetime.datetime.now()
         start_date = end_date - datetime.timedelta(days=5*365)
         period1 = int(time.mktime(start_date.timetuple()))
@@ -394,7 +463,6 @@ class DataFetcher:
                         raise DataFetchError(f"Failed to fetch data for {ticker}: HTTP {response.status}")
                     csv_data = await response.text()
                     df = pd.read_csv(io.StringIO(csv_data), parse_dates=["Date"], index_col="Date")
-                    # Cache the data with current timestamp
                     self.cache[ticker] = {
                         "data": df.to_json(date_format='iso'),
                         "timestamp": current_time
@@ -402,13 +470,15 @@ class DataFetcher:
                     self.save_cache()
                     return df
         except Exception as e:
-            logger.error(f"Error fetching data for {ticker}: {e}")
+            logger.exception(f"Error fetching data for {ticker}: {e}")
             raise DataFetchError(e)
 
     @async_retry((NetworkError, Exception), tries=3, delay=2, backoff=2)
     async def fetch_news_sentiment(self, ticker: str) -> float:
-        import aiohttp
-        from bs4 import BeautifulSoup
+        """
+        Asynchronously fetch news sentiment scores for a ticker.
+        """
+        from bs4 import BeautifulSoup  # Import here to allow optional dependency
         urls: List[str] = [
             f"https://www.businesswire.com/portal/site/home/?search={ticker}",
             f"https://www.reuters.com/search/news?blob={ticker}",
@@ -428,7 +498,7 @@ class DataFetcher:
                             score = self._sentiment_transformer.analyze(texts)
                             sentiment_scores.append(score)
                 except Exception as ex:
-                    logger.error(f"Error fetching news from {url}: {ex}")
+                    logger.exception(f"Error fetching news from {url}: {ex}")
             await asyncio.gather(*(fetch(url) for url in urls))
         return np.mean(sentiment_scores) if sentiment_scores else 0.0
 
@@ -436,6 +506,9 @@ class DataFetcher:
 # Option Greeks and Pricing
 # -----------------------------
 def calculate_option_greeks(S: float, K: float, T: float, r: float, sigma: float) -> Tuple[float, float, float, float]:
+    """
+    Calculate delta, gamma, theta, and vega for an option using Black-Scholes parameters.
+    """
     d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T) + 1e-12)
     d2 = d1 - sigma * math.sqrt(T)
     N = lambda x: 0.5 * (1 + math.erf(x / math.sqrt(2)))
@@ -447,16 +520,22 @@ def calculate_option_greeks(S: float, K: float, T: float, r: float, sigma: float
     return delta, gamma, theta, vega
 
 def get_benchmark_returns(benchmark_ticker: str = "^GSPC", start: Optional[str] = None, end: Optional[str] = None) -> np.ndarray:
+    """
+    Fetch benchmark returns using yfinance.
+    """
     try:
         benchmark = yf.Ticker(benchmark_ticker)
         df_bench = benchmark.history(start=start, end=end).dropna()
         returns = np.log(df_bench["Close"] / df_bench["Close"].shift(1)).dropna().values
         return returns
     except Exception as e:
-        logger.error(f"Error fetching benchmark returns: {e}")
+        logger.exception(f"Error fetching benchmark returns: {e}")
         return np.array([])
 
 def risk_adjusted_metrics(returns: np.ndarray, benchmark: Optional[np.ndarray] = None, rf: float = 0.01) -> Dict[str, float]:
+    """
+    Calculate risk-adjusted metrics.
+    """
     std = np.std(returns)
     sharpe = np.mean(returns - rf) / (std + 1e-6) if std > 0 else 0.0
     downside = np.std([r for r in returns if r < rf])
@@ -468,6 +547,9 @@ def risk_adjusted_metrics(returns: np.ndarray, benchmark: Optional[np.ndarray] =
     return {"Sharpe": sharpe, "Sortino": sortino, "Treynor": treynor, "Calmar": calmar, "Beta": beta}
 
 class OptionPricing:
+    """
+    Option pricing methods including Black-Scholes, Binomial, Monte Carlo (CPU and GPU) and Jump Diffusion.
+    """
     @staticmethod
     def black_scholes(S: float, K: float, T: float, r: float, sigma: float, option_type: str = 'call') -> float:
         d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
@@ -513,6 +595,9 @@ class OptionPricing:
 # Technical Indicators (Vectorized using Pandas/NumPy)
 # -----------------------------
 class TechnicalIndicators:
+    """
+    A collection of technical indicator methods.
+    """
     @staticmethod
     def WMA(series: pd.Series, period: int) -> pd.Series:
         weights = np.arange(1, period + 1)
@@ -646,6 +731,9 @@ class TechnicalIndicators:
 # Hidden Markov Model (HMM)
 # -----------------------------
 class HiddenMarkovModel:
+    """
+    A simple Hidden Markov Model implementation using the EM algorithm.
+    """
     def __init__(self, n_states: int = 2, seed: Optional[int] = None) -> None:
         self.n_states: int = n_states
         if seed is not None:
@@ -750,6 +838,9 @@ def fit_parallel_hmm(observations: np.ndarray, n_states: int, n_iter: int = 10, 
 # Feature Extraction and Reduction
 # -----------------------------
 def extract_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Extract common technical indicators and other features from price data.
+    """
     features = pd.DataFrame(index=df.index)
     features["Close"] = df["Close"]
     features["WMA"] = TechnicalIndicators.WMA(df["Close"], 20)
@@ -776,10 +867,16 @@ def extract_features(df: pd.DataFrame) -> pd.DataFrame:
     return features.fillna(method="bfill").fillna(method="ffill")
 
 def augment_features(features: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add Gaussian noise to features to aid in regularization.
+    """
     noise = np.random.normal(0, 0.001, size=features.shape)
     return features + noise
 
 def pca_reduce(features: pd.DataFrame, n_components: int = 10) -> pd.DataFrame:
+    """
+    Reduce dimensionality of features using Singular Value Decomposition.
+    """
     X = features.values - np.mean(features.values, axis=0)
     U, s, _ = svd(X, full_matrices=False)
     X_reduced = U[:, :n_components] * s[:n_components]
@@ -789,6 +886,9 @@ def pca_reduce(features: pd.DataFrame, n_components: int = 10) -> pd.DataFrame:
 # Neural Network with JAX using Optax
 # -----------------------------
 class NeuralNetworkJAX:
+    """
+    Neural network implemented using JAX and Optax.
+    """
     def __init__(self,
                  input_dim: int,
                  output_dim: int,
@@ -825,12 +925,14 @@ class NeuralNetworkJAX:
             f"b{i+1}": jnp.array(np.zeros(layers[i+1]))
             for i in range(len(layers) - 1)
         })
-        # Initialize the optax optimizer (Adam)
         self.optimizer = optax.adam(self.learning_rate)
         self.opt_state = self.optimizer.init(self.params)
 
     def forward(self, X: jnp.ndarray, params: Optional[Dict[str, jnp.ndarray]] = None,
                 dropout_key: Optional[jnp.ndarray] = None, is_training: bool = True) -> jnp.ndarray:
+        """
+        Forward propagation through the network.
+        """
         if params is None:
             params = self.params
         a = X
@@ -850,6 +952,9 @@ class NeuralNetworkJAX:
         return a
 
     def loss(self, params: Dict[str, jnp.ndarray], X: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
+        """
+        Compute mean squared error loss with L2 regularization.
+        """
         pred = self.forward(X, params, is_training=True)
         mse = jnp.mean((pred - y) ** 2)
         l2_reg = sum(jnp.sum(jnp.square(p)) for p in params.values())
@@ -857,6 +962,9 @@ class NeuralNetworkJAX:
 
     @profile
     def train(self, X: np.ndarray, y: np.ndarray, epochs: int = 100, early_stopping: int = 10) -> List[float]:
+        """
+        Train the neural network on data X and labels y.
+        """
         X_jax, y_jax = jnp.array(X), jnp.array(y)
 
         @jax.jit
@@ -892,10 +1000,13 @@ class NeuralNetworkJAX:
             plt.savefig("loss_curve_jax_optax.png")
             plt.close()
         except Exception as e:
-            logger.error(f"Error plotting loss: {e}")
+            logger.exception(f"Error plotting loss: {e}")
         return self.loss_history
 
     def predict(self, X: np.ndarray) -> jnp.ndarray:
+        """
+        Make predictions on new data.
+        """
         X_jax = jnp.array(X)
         return self.forward(X_jax, is_training=False)
 
@@ -907,6 +1018,9 @@ from functools import partial
 @partial(jit, static_argnames=['N', 'M'])
 def heston_model_sim_jax(S0: float, v0: float, rho: float, kappa: float, theta: float,
                          sigma: float, r: float, T: float, N: int, M: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Simulate stock prices and variances using the Heston model.
+    """
     dt = T / N
     mu = jnp.array([0.0, 0.0])
     cov = jnp.array([[1.0, rho], [rho, 1.0]])
@@ -930,6 +1044,9 @@ def heston_model_sim_jax(S0: float, v0: float, rho: float, kappa: float, theta: 
 # Dashboard for Real-Time Monitoring
 # -----------------------------
 def start_dashboard(metrics_data: Dict[str, Any]) -> None:
+    """
+    Start a Dash dashboard to monitor performance metrics.
+    """
     app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
     app.layout = dbc.Container([
         dbc.Row([dbc.Col(html.H2("Live Performance Dashboard"), width=12)]),
@@ -960,6 +1077,9 @@ def start_dashboard(metrics_data: Dict[str, Any]) -> None:
 # Optimization Functions
 # -----------------------------
 def advanced_bayesian_optimization_lr(X_train: np.ndarray, y_train: np.ndarray, n_iter: int = 25) -> Tuple[float, Any]:
+    """
+    Optimize learning rate for the neural network using Bayesian optimization.
+    """
     def objective_lr(lr: float) -> float:
         nn = NeuralNetworkJAX(input_dim=X_train.shape[1], output_dim=1, learning_rate=lr)
         loss_history = nn.train(X_train, y_train, epochs=10, early_stopping=3)
@@ -979,6 +1099,9 @@ def advanced_bayesian_optimization_lr(X_train: np.ndarray, y_train: np.ndarray, 
 # Parallelize Walk-Forward Optimization using Dask
 # -----------------------------
 def walk_forward_optimization(features: pd.DataFrame, targets: pd.Series, window: int = 100) -> List[Tuple[Any, float]]:
+    """
+    Perform walk-forward optimization by training on windows and predicting the next step.
+    """
     @delayed
     def process_window(start):
         X_train = features.iloc[start:start + window].values
@@ -990,9 +1113,7 @@ def walk_forward_optimization(features: pd.DataFrame, targets: pd.Series, window
         pred_val = float(nn_jax.predict(X_pred)[0])
         return (features.index[start + window], pred_val)
     
-    tasks = []
-    for start in range(0, len(features) - window, window):
-        tasks.append(process_window(start))
+    tasks = [process_window(start) for start in range(0, len(features) - window, window)]
     predictions = compute(*tasks)
     return list(predictions)
 
@@ -1000,6 +1121,9 @@ def walk_forward_optimization(features: pd.DataFrame, targets: pd.Series, window
 # Asynchronous GPU Option Pricing Helper
 # -----------------------------
 async def _fetch_option_prices(latest_close: float, strike: float, T: float, r: float, sigma: float) -> Tuple[float, float, float]:
+    """
+    Asynchronously fetch option prices using different pricing models.
+    """
     bs_task = asyncio.to_thread(OptionPricing.black_scholes, latest_close, strike, T, r, sigma, "call")
     binom_task = asyncio.to_thread(OptionPricing.binomial, latest_close, strike, T, r, sigma, 100, "call")
     mc_task = asyncio.to_thread(OptionPricing.monte_carlo_gpu, latest_close, strike, T, r, sigma, 10000, "call")
@@ -1009,6 +1133,9 @@ async def _fetch_option_prices(latest_close: float, strike: float, T: float, r: 
 # Ticker Processing Functions
 # -----------------------------
 def process_ticker(ticker: str) -> Optional[Dict[str, Any]]:
+    """
+    Process a single ticker: fetch data, extract features, optimize model, and compute option pricing.
+    """
     try:
         data_fetcher = DataFetcher()
         df = run_async(data_fetcher.async_fetch_stock_data(ticker))
@@ -1053,15 +1180,21 @@ def process_ticker(ticker: str) -> Optional[Dict[str, Any]]:
             "Cluster": cluster_id
         }
     except Exception as e:
-        logger.error(f"Error processing ticker {ticker}: {e}")
+        logger.exception(f"Error processing ticker {ticker}")
         return None
 
 def parallel_ticker_processing(tickers: List[str]) -> List[Dict[str, Any]]:
+    """
+    Process a list of tickers in parallel using multiprocessing.
+    """
     with mp.Pool(processes=min(len(tickers), mp.cpu_count())) as pool:
         results = pool.map(process_ticker, tickers)
     return [res for res in results if res is not None]
 
 def gpu_vector_test() -> Optional[np.ndarray]:
+    """
+    Test the MultiGPUAccelerator by multiplying two random vectors and checking against CPU multiplication.
+    """
     try:
         multi_gpu_accel = MultiGPUAccelerator()
         a = np.random.rand(1000000)
@@ -1072,10 +1205,13 @@ def gpu_vector_test() -> Optional[np.ndarray]:
         logger.info("MultiGPU vector multiply test passed.")
         return result
     except Exception as e:
-        logger.error(f"MultiGPU test failed: {e}")
+        logger.exception(f"MultiGPU test failed: {e}")
         return None
 
 def build_prediction_table(results: List[Dict[str, Any]]) -> Optional[pd.DataFrame]:
+    """
+    Build a prediction table DataFrame from ticker processing results.
+    """
     rows: List[Dict[str, Any]] = []
     for res in results:
         if res.get("Predictions"):
@@ -1093,6 +1229,9 @@ def build_prediction_table(results: List[Dict[str, Any]]) -> Optional[pd.DataFra
     return pd.DataFrame(rows) if rows else None
 
 def plot_performance_metrics(results: List[Dict[str, Any]]) -> None:
+    """
+    Plot a scatter plot of sentiments vs. Black-Scholes prices.
+    """
     tickers = [res["Ticker"] for res in results if res]
     sentiments = [res["Sentiment"] for res in results if res]
     bs_prices = [res["BS_Price"] for res in results if res]
@@ -1107,12 +1246,15 @@ def plot_performance_metrics(results: List[Dict[str, Any]]) -> None:
         plt.savefig("performance_metrics.png")
         plt.close()
     except Exception as e:
-        logger.error(f"Error plotting performance metrics: {e}")
+        logger.exception(f"Error plotting performance metrics: {e}")
 
 # -----------------------------
 # Main Execution Function
 # -----------------------------
 def main() -> None:
+    """
+    Main execution entry point. Processes tickers and launches dashboard.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--test", action="store_true", help="Run unit tests and exit")
     parser.add_argument("--tickers", type=str, help="Comma-separated tickers")
@@ -1133,7 +1275,7 @@ def main() -> None:
             tickers_input = input("Enter tickers (comma separated): ")
             tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
         except Exception as e:
-            logger.error(f"Input error: {e}")
+            logger.exception(f"Input error: {e}")
             sys.exit(1)
     if not tickers:
         logger.error("No tickers provided. Exiting.")
@@ -1151,7 +1293,7 @@ def main() -> None:
     try:
         gpu_vector_test()
     except Exception as e:
-        logger.error(f"GPU test failed: {e}")
+        logger.exception(f"GPU test failed: {e}")
 
     prediction_table = build_prediction_table(results)
     if prediction_table is not None and not prediction_table.empty:
@@ -1176,6 +1318,9 @@ def main() -> None:
 # Unit and Integration Tests
 # -----------------------------
 def run_tests() -> None:
+    """
+    Run unit tests on key functions and modules.
+    """
     logger.info("Running unit tests...")
     a = np.array([1.0, 2.0, 3.0])
     b = np.array([1.0, 2.0, 3.0])
@@ -1229,6 +1374,9 @@ def run_tests() -> None:
     logger.info("All tests passed.")
 
 def perform_clustering(tickers: List[str], n_clusters: int = 2) -> Dict[str, int]:
+    """
+    Perform clustering on tickers using Friday returns.
+    """
     features_list = []
     valid_tickers = []
     for ticker in tickers:
@@ -1244,7 +1392,7 @@ def perform_clustering(tickers: List[str], n_clusters: int = 2) -> Dict[str, int
             features_list.append([avg_return, std_return, avg_volume])
             valid_tickers.append(ticker)
         except Exception as e:
-            logger.error(f"Clustering failed for ticker {ticker}: {e}")
+            logger.exception(f"Clustering failed for ticker {ticker}: {e}")
     if not features_list:
         return {}
     X = np.array(features_list)
@@ -1252,7 +1400,7 @@ def perform_clustering(tickers: List[str], n_clusters: int = 2) -> Dict[str, int
         clusterer = hdbscan.HDBSCAN(min_cluster_size=3)
         labels = clusterer.fit_predict(X)
     except Exception as e:
-        logger.error(f"HDBSCAN clustering failed: {e}")
+        logger.exception(f"HDBSCAN clustering failed: {e}")
         labels = [-1] * len(valid_tickers)
     logger.info(f"Clustering completed. Labels: {labels}")
     return {ticker: int(label) for ticker, label in zip(valid_tickers, labels)}
