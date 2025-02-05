@@ -11,6 +11,12 @@ import argparse
 import io
 from functools import wraps, partial, lru_cache
 import concurrent.futures
+import pickle
+
+# Use JAX instead of numpy where possible.
+import jax
+import jax.numpy as jnp
+from jax import jit, grad, lax, random, pmap, vmap
 
 import numpy as np
 import pandas as pd
@@ -18,9 +24,6 @@ from numpy.linalg import svd
 
 # THIRD–PARTY LIBRARIES
 from numba import njit, prange
-import jax
-import jax.numpy as jnp
-from jax import jit, grad, lax, random, pmap
 import optax
 from transformers import pipeline
 from bayes_opt import BayesianOptimization
@@ -39,11 +42,17 @@ from celery import Celery
 from flask import Flask
 from flask_socketio import SocketIO, emit
 
+# New imports for structured logging and database caching
+from pythonjsonlogger import jsonlogger
+from sqlalchemy import create_engine, Column, String, Float, Text, DateTime
+from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.exc import SQLAlchemyError
+from sklearn.model_selection import KFold
+
 # -----------------------------
 # Global Configuration and Memory Cache
 # -----------------------------
 CONFIG: dict[str, any] = {
-    "CACHE_FILE": "data_cache.json",
     "LOG_FILE": "model_log.txt",
     "RUN_DAY": 0,         # Monday
     "RUN_HOUR": 16,       # 16:00 local time
@@ -53,17 +62,19 @@ CONFIG: dict[str, any] = {
 GLOBAL_SENTIMENT_WEIGHT = 0.3  # weight for embedding score (the basic FinBERT score weight will be 1 - this)
 GLOBAL_ENSEMBLE_WEIGHT = 0.5   # weight for Flax NN in ensemble (the LightGBM weight will be 1 - this)
 
-# Setup joblib memory cache
-memory = Memory(location="./joblib_cache", verbose=0)
+# Paths for persistent model files
+FLAX_MODEL_PATH = "flax_model_params.bin"
+LIGHTGBM_MODEL_PATH = "lgb_model.txt"
+ENSEMBLE_CONFIG_PATH = "ensemble_config.json"  # to store ensemble blend weight and sentiment weight
 
 # -----------------------------
-# Logging Configuration
+# Structured Logging Configuration using JSON formatter
 # -----------------------------
 def configure_logging() -> None:
-    """Configure logging for the application."""
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
-    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    log_format = '%(asctime)s %(levelname)s %(name)s %(message)s'
+    formatter = jsonlogger.JsonFormatter(log_format)
     # Console handler
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
@@ -79,10 +90,58 @@ configure_logging()
 logger = logging.getLogger(__name__)
 
 # -----------------------------
+# Database Caching with SQLAlchemy
+# -----------------------------
+Base = declarative_base()
+
+class CacheEntry(Base):
+    __tablename__ = 'cache'
+    ticker = Column(String, primary_key=True)
+    data = Column(Text)  # JSON data
+    timestamp = Column(Float)
+
+# Create SQLite engine and session factory.
+engine = create_engine("sqlite:///cache.db", echo=False)
+SessionLocal = sessionmaker(bind=engine)
+Base.metadata.create_all(bind=engine)
+
+class CacheDB:
+    def __init__(self):
+        self.session = SessionLocal()
+
+    def get(self, ticker: str) -> dict:
+        try:
+            entry = self.session.query(CacheEntry).filter(CacheEntry.ticker == ticker).first()
+            if entry:
+                return {"data": entry.data, "timestamp": entry.timestamp}
+            return {}
+        except SQLAlchemyError as e:
+            logger.error(f"CacheDB get error: {e}")
+            return {}
+
+    def set(self, ticker: str, data: str, timestamp: float) -> None:
+        try:
+            entry = self.session.query(CacheEntry).filter(CacheEntry.ticker == ticker).first()
+            if entry:
+                entry.data = data
+                entry.timestamp = timestamp
+            else:
+                entry = CacheEntry(ticker=ticker, data=data, timestamp=timestamp)
+                self.session.add(entry)
+            self.session.commit()
+        except SQLAlchemyError as e:
+            logger.error(f"CacheDB set error: {e}")
+            self.session.rollback()
+
+# -----------------------------
+# Joblib Memory Cache (kept for non-cache routines)
+# -----------------------------
+memory = Memory(location="./joblib_cache", verbose=0)
+
+# -----------------------------
 # Celery and Flask–SocketIO Setup
 # -----------------------------
 celery_app = Celery('tasks', broker='redis://localhost:6379/0')
-# Optimize worker pool: use as many workers as CPU cores and note that task prioritization can be configured.
 celery_app.conf.update(worker_concurrency=os.cpu_count())
 flask_app = Flask(__name__)
 flask_app.config['SECRET_KEY'] = 'secret!'
@@ -139,66 +198,6 @@ def profile(func: callable) -> callable:
     return wrapper
 
 # -----------------------------
-# Utility Functions
-# -----------------------------
-def atomic_save(cache: dict[str, any], filename: str) -> None:
-    temp_filename = filename + ".tmp"
-    with open(temp_filename, 'w') as f:
-        json.dump(cache, f)
-    os.replace(temp_filename, filename)
-
-# -----------------------------
-# Optimized Numerical Kernels with Numba
-# -----------------------------
-@njit(fastmath=True, parallel=True)
-def fast_cpu_distance(x: np.ndarray, y: np.ndarray) -> float:
-    diff = x - y
-    total = 0.0
-    n = diff.shape[0]
-    unroll_factor = 4
-    limit = n - (n % unroll_factor)
-    for i in range(0, limit, unroll_factor):
-        total += diff[i]**2 + diff[i+1]**2 + diff[i+2]**2 + diff[i+3]**2
-    for i in range(limit, n):
-        total += diff[i]**2
-    return total
-
-@njit(fastmath=True)
-def binomial_option_unrolled(S: float, K: float, T: float, r: float, sigma: float, N: int, option_type: str) -> float:
-    dt = T / N
-    u = math.exp(sigma * math.sqrt(dt))
-    d = 1.0 / u
-    p = (math.exp(r * dt) - d) / (u - d)
-    asset_prices = np.empty(N + 1, dtype=np.float64)
-    for j in range(N + 1):
-        asset_prices[j] = S * (u ** j) * (d ** (N - j))
-    if option_type.lower() == 'call':
-        for j in range(N + 1):
-            asset_prices[j] = max(asset_prices[j] - K, 0.0)
-    else:
-        for j in range(N + 1):
-            asset_prices[j] = max(K - asset_prices[j], 0.0)
-    for i in range(N, 0, -1):
-        discount = math.exp(-r * dt)
-        total_steps = i
-        unroll = 4
-        limit = total_steps - (total_steps % unroll)
-        j = 0
-        while j < limit:
-            asset_prices[j] = discount * (p * asset_prices[j + 1] + (1.0 - p) * asset_prices[j])
-            asset_prices[j+1] = discount * (p * asset_prices[j+2] + (1.0 - p) * asset_prices[j+1])
-            asset_prices[j+2] = discount * (p * asset_prices[j+3] + (1.0 - p) * asset_prices[j+2])
-            if (j + 3) < total_steps:
-                asset_prices[j+3] = discount * (p * asset_prices[j+4] + (1.0 - p) * asset_prices[j+3])
-            else:
-                asset_prices[j+3] = discount * asset_prices[j+3]
-            j += unroll
-        while j < total_steps:
-            asset_prices[j] = discount * (p * asset_prices[j+1] + (1.0 - p) * asset_prices[j])
-            j += 1
-    return asset_prices[0]
-
-# -----------------------------
 # GPU Accelerator (MetalCompute) with MultiGPU Optimized Execution
 # -----------------------------
 class GPUAccelerator:
@@ -246,7 +245,6 @@ class MultiGPUAccelerator:
         logger.info(f"MultiGPUAccelerator using devices: {[d.name for d in self.devices]}")
     
     def vector_multiply(self, a_np: np.ndarray, b_np: np.ndarray) -> np.ndarray:
-        # Use JAX pmap with device sharding for optimal multi-GPU performance.
         a_np = np.ascontiguousarray(a_np.astype(np.float32))
         b_np = np.ascontiguousarray(b_np.astype(np.float32))
         total_elements = a_np.shape[0]
@@ -305,38 +303,33 @@ class SentimentTransformer:
         return SentimentTransformer().basic_score(text)
 
 # -----------------------------
-# Data Fetching and Caching (Async with aiohttp) with Enhanced Concurrency
+# Data Fetching and Caching (Async with aiohttp) with Enhanced Concurrency and Database Cache
 # -----------------------------
 class DataFetchError(Exception):
     pass
 
 class DataFetcher:
-    def __init__(self, cache_file: str = CONFIG["CACHE_FILE"]) -> None:
-        self.cache_file: str = cache_file
-        self.cache: dict[str, any] = {}
-        if os.path.exists(cache_file):
-            try:
-                with open(cache_file, 'r') as f:
-                    self.cache = json.load(f)
-            except Exception as e:
-                logger.error(f"Error loading cache: {e}")
+    def __init__(self) -> None:
+        self.cache_db = CacheDB()
         self._sentiment_transformer = SentimentTransformer()
 
-    def save_cache(self) -> None:
-        atomic_save(self.cache, self.cache_file)
+    def save_cache(self, ticker: str, data: pd.DataFrame, timestamp: float) -> None:
+        try:
+            self.cache_db.set(ticker, data.to_json(date_format='iso'), timestamp)
+        except Exception as e:
+            logger.error(f"Error saving cache for {ticker}: {e}")
 
     @async_retry((DataFetchError, Exception), tries=3, delay=2, backoff=2)
     async def async_fetch_stock_data(self, ticker: str, period: str = '5y') -> pd.DataFrame:
         current_time = time.time()
-        if ticker in self.cache:
-            entry = self.cache[ticker]
-            if current_time - entry.get("timestamp", 0) < CONFIG["CACHE_EXPIRY"]:
-                logger.info(f"Loading cached data for {ticker}")
-                try:
-                    df = pd.read_json(entry["data"], convert_dates=True)
-                    return df
-                except Exception as e:
-                    logger.exception(f"Error reading cache for {ticker}: {e}")
+        cache_entry = self.cache_db.get(ticker)
+        if cache_entry and (current_time - cache_entry.get("timestamp", 0) < CONFIG["CACHE_EXPIRY"]):
+            logger.info(f"Loading cached data for {ticker}")
+            try:
+                df = pd.read_json(cache_entry["data"], convert_dates=True)
+                return df
+            except Exception as e:
+                logger.exception(f"Error reading cache for {ticker}: {e}")
         end_date = datetime.datetime.now()
         start_date = end_date - datetime.timedelta(days=5*365)
         period1 = int(time.mktime(start_date.timetuple()))
@@ -353,8 +346,7 @@ class DataFetcher:
                     df = pd.read_csv(io.StringIO(csv_data), parse_dates=["Date"], index_col="Date")
                 except Exception as e:
                     raise DataFetchError(f"Error parsing CSV for {ticker}: {e}")
-                self.cache[ticker] = {"data": df.to_json(date_format='iso'), "timestamp": current_time}
-                self.save_cache()
+                self.save_cache(ticker, df, current_time)
                 return df
 
     @async_retry((Exception,), tries=3, delay=2, backoff=2)
@@ -373,12 +365,10 @@ class DataFetcher:
                             text = await response.text()
                             soup = BeautifulSoup(text, 'html.parser')
                             texts = " ".join(p.get_text() for p in soup.find_all('p'))
-                            # Launch sentiment analysis concurrently as a task
                             score = await self._sentiment_transformer.analyze_custom(texts)
                             scores.append(score)
                 except Exception as e:
                     logger.error(f"Error fetching {url}: {e}")
-            # Run all fetch tasks concurrently.
             await asyncio.gather(*(fetch_and_analyze(url) for url in urls), return_exceptions=True)
         return float(np.mean(scores)) if scores else 0.0
 
@@ -407,31 +397,22 @@ class OptionPricing:
         return binomial_option_unrolled(S, K, T, r, sigma, steps, option_type)
 
     @staticmethod
-    def monte_carlo(S: float, K: float, T: float, r: float, sigma: float, simulations: int = 10000, option_type: str = 'call') -> float:
-        dt = T
-        rand = np.random.standard_normal(simulations)
-        ST = S * np.exp((r - 0.5*sigma**2)*dt + sigma*math.sqrt(dt)*rand)
-        payoff = np.maximum(ST - K, 0) if option_type.lower() == 'call' else np.maximum(K - ST, 0)
-        return math.exp(-r*T)*np.mean(payoff)
+    @jit
+    def monte_carlo_vec(S: float, K: float, T: float, r: float, sigma: float, option_type: str, key: jnp.ndarray) -> float:
+        def sim_fn(k):
+            rand = random.normal(k, shape=(10000,))
+            ST = S * jnp.exp((r - 0.5*sigma**2)*T + sigma*jnp.sqrt(T)*rand)
+            payoff = jnp.where(option_type.lower()=='call', jnp.maximum(ST-K, 0), jnp.maximum(K-ST, 0))
+            return jnp.mean(payoff)
+        keys = random.split(key, 10)
+        payoffs = vmap(sim_fn)(keys)
+        return float(jnp.exp(-r*T) * jnp.mean(payoffs))
 
     @staticmethod
     def monte_carlo_gpu_parallel(S: float, K: float, T: float, r: float, sigma: float,
                                  simulations: int = 10000, option_type: str = 'call') -> float:
-        dt = T
-        devices = jax.local_devices()
-        n_devices = len(devices)
-        sims_per_device = simulations // n_devices
-        # Split the key for each device
-        keys = random.split(random.PRNGKey(int(time.time())), n_devices)
-        def simulation(key):
-            rand = random.normal(key, shape=(sims_per_device,))
-            ST = S * jnp.exp((r - 0.5*sigma**2)*dt + sigma*jnp.sqrt(dt)*rand)
-            payoff = jnp.where(option_type.lower()=='call', jnp.maximum(ST-K, 0), jnp.maximum(K-ST, 0))
-            return jnp.mean(payoff)
-        pmap_simulation = jax.pmap(simulation)
-        means = pmap_simulation(jnp.array(keys))
-        overall_mean = jnp.mean(means)
-        return float(jnp.exp(-r*T)*overall_mean)
+        key = random.PRNGKey(int(time.time()))
+        return OptionPricing.monte_carlo_vec(S, K, T, r, sigma, option_type, key)
 
     @staticmethod
     def jump_diffusion(S: float, K: float, T: float, r: float, sigma: float,
@@ -442,6 +423,57 @@ class OptionPricing:
             sigma_k = math.sqrt(sigma**2 + k*(sigmaJ**2)/T)
             price += poisson_prob * OptionPricing.black_scholes(S, K, T, r, sigma_k, option_type)
         return price
+
+# -----------------------------
+# Optimized Numerical Kernels with Numba
+# -----------------------------
+@njit(fastmath=True, parallel=True)
+def fast_cpu_distance(x: np.ndarray, y: np.ndarray) -> float:
+    diff = x - y
+    total = 0.0
+    n = diff.shape[0]
+    unroll_factor = 4
+    limit = n - (n % unroll_factor)
+    for i in range(0, limit, unroll_factor):
+        total += diff[i]**2 + diff[i+1]**2 + diff[i+2]**2 + diff[i+3]**2
+    for i in range(limit, n):
+        total += diff[i]**2
+    return total
+
+@njit(fastmath=True)
+def binomial_option_unrolled(S: float, K: float, T: float, r: float, sigma: float, N: int, option_type: str) -> float:
+    dt = T / N
+    u = math.exp(sigma * math.sqrt(dt))
+    d = 1.0 / u
+    p = (math.exp(r * dt) - d) / (u - d)
+    asset_prices = np.empty(N + 1, dtype=np.float64)
+    for j in range(N + 1):
+        asset_prices[j] = S * (u ** j) * (d ** (N - j))
+    if option_type.lower() == 'call':
+        for j in range(N + 1):
+            asset_prices[j] = max(asset_prices[j] - K, 0.0)
+    else:
+        for j in range(N + 1):
+            asset_prices[j] = max(K - asset_prices[j], 0.0)
+    for i in range(N, 0, -1):
+        discount = math.exp(-r * dt)
+        total_steps = i
+        unroll = 4
+        limit = total_steps - (total_steps % unroll)
+        j = 0
+        while j < limit:
+            asset_prices[j] = discount * (p * asset_prices[j + 1] + (1.0 - p) * asset_prices[j])
+            asset_prices[j+1] = discount * (p * asset_prices[j+2] + (1.0 - p) * asset_prices[j+1])
+            asset_prices[j+2] = discount * (p * asset_prices[j+3] + (1.0 - p) * asset_prices[j+2])
+            if (j + 3) < total_steps:
+                asset_prices[j+3] = discount * (p * asset_prices[j+4] + (1.0 - p) * asset_prices[j+3])
+            else:
+                asset_prices[j+3] = discount * asset_prices[j+3]
+            j += unroll
+        while j < total_steps:
+            asset_prices[j] = discount * (p * asset_prices[j+1] + (1.0 - p) * asset_prices[j])
+            j += 1
+    return asset_prices[0]
 
 # -----------------------------
 # Optimized Technical Indicators for Parallel Computation
@@ -480,9 +512,6 @@ def optimized_macd(close: np.ndarray) -> np.ndarray:
 # Feature Extraction & PCA Parallelization
 # -----------------------------
 def pca_reduce(features: pd.DataFrame, n_components: int = 10, mode: str = "jax") -> pd.DataFrame:
-    """
-    mode: "jax" for GPU-accelerated SVD; "joblib" for CPU parallelism.
-    """
     X = features.values - np.mean(features.values, axis=0)
     if mode == "jax":
         @jit
@@ -491,9 +520,7 @@ def pca_reduce(features: pd.DataFrame, n_components: int = 10, mode: str = "jax"
         U, s, _ = compute_svd(X)
         U, s = np.array(U), np.array(s)
     else:
-        # CPU-parallel version using joblib
         U, s, _ = svd(X, full_matrices=False)
-        # Optionally, you could wrap parts of this with Parallel(delayed(...))
     X_reduced = U[:, :n_components] * s[:n_components]
     return pd.DataFrame(X_reduced, index=features.index)
 
@@ -532,11 +559,11 @@ class FlaxMLP(nn.Module):
     @nn.compact
     def __call__(self, x, train: bool = True):
         for h in self.hidden_layers:
-            x = nn.Dense(h, dtype=jnp.float16)(x)
+            x = nn.Dense(h, dtype=jnp.float32)(x)
             x = nn.relu(x)
             if self.dropout_rate > 0.0:
                 x = nn.Dropout(self.dropout_rate)(x, deterministic=not train)
-        return nn.Dense(self.output_dim, dtype=jnp.float16)(x)
+        return nn.Dense(self.output_dim, dtype=jnp.float32)(x)
 
 class FlaxNeuralNetwork:
     def __init__(self, input_dim: int, output_dim: int, hidden_layers: list[int] | None = None,
@@ -567,20 +594,23 @@ class FlaxNeuralNetwork:
         return params, opt_state, loss
 
     def train(self, X: np.ndarray, y: np.ndarray, epochs: int = 100, batch_size: int = 32) -> list[float]:
-        X = X.astype(np.float16)
-        y = y.astype(np.float16)
+        X = X.astype(np.float32)
+        y = y.astype(np.float32)
         num_samples = X.shape[0]
         losses = []
         rng = jax.random.PRNGKey(int(time.time()))
         self.init(rng, jnp.array(X[:batch_size]))
-        for epoch in range(epochs):
-            perm = np.random.permutation(num_samples)
-            for i in range(0, num_samples, batch_size):
-                idx = perm[i:i+batch_size]
-                batch = (jnp.array(X[idx]), jnp.array(y[idx]))
-                self.params, self.opt_state, loss = self.train_step(self.params, self.opt_state, batch)
-            losses.append(float(loss))
-            logger.info(f"Epoch {epoch+1}: loss {loss:.4f}")
+        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
+            X_train, y_train = X[train_idx], y[train_idx]
+            for epoch in range(epochs):
+                perm = np.random.permutation(X_train.shape[0])
+                for i in range(0, X_train.shape[0], batch_size):
+                    idx = perm[i:i+batch_size]
+                    batch = (jnp.array(X_train[idx]), jnp.array(y_train[idx]))
+                    self.params, self.opt_state, loss = self.train_step(self.params, self.opt_state, batch)
+                losses.append(float(loss))
+                logger.info(f"Fold {fold+1} Epoch {epoch+1}: loss {loss:.4f}")
         return losses
 
     @jax.jit
@@ -598,12 +628,12 @@ class FlaxNeuralNetwork:
         return self.predict(X)
 
 # -----------------------------
-# LightGBM Training for Ensemble
+# LightGBM Training for Ensemble with k–fold cross validation
 # -----------------------------
 def train_lightgbm(X_train: np.ndarray, y_train: np.ndarray) -> any:
-    lgb_train = lgb.Dataset(X_train, label=y_train)
+    lgb_train = lgb.Dataset(X_train, label=y_train.ravel())
     params = {'objective': 'regression', 'metric': 'rmse', 'verbosity': -1}
-    model = lgb.train(params, lgb_train, num_boost_round=50)
+    model = lgb.train(params, lgb_train, num_boost_round=100)
     return model
 
 # -----------------------------
@@ -619,20 +649,16 @@ def optimize_ensemble_weight(X: np.ndarray, y: np.ndarray) -> float:
         w = float(w)
         flax_nn = FlaxNeuralNetwork(input_dim=X.shape[1], output_dim=1, learning_rate=1e-3)
         flax_nn.train(X, y, epochs=10, batch_size=16)
-        lgb_model = train_lightgbm(X, y.ravel())
+        lgb_model = train_lightgbm(X, y)
         preds = ensemble_predict(X, flax_nn, lgb_model, blend_weight=w)
         rmse = np.sqrt(np.mean((preds - y.ravel())**2))
-        return -rmse  # maximize negative RMSE
-
+        return -rmse
     optimizer = BayesianOptimization(f=objective, pbounds={'w': (0.0, 1.0)}, random_state=42, verbose=0)
     optimizer.maximize(init_points=5, n_iter=10)
     best_w = optimizer.max['params']['w']
     logger.info(f"Optimal ensemble blend weight: {best_w}")
     return best_w
 
-# -----------------------------
-# Auto–Tune Sentiment Blend Weight
-# -----------------------------
 def optimize_sentiment_weight(texts: list[str], true_scores: list[float]) -> float:
     def objective(w: float) -> float:
         w = float(w)
@@ -672,6 +698,83 @@ def heston_model_sim_jax(S0: float, v0: float, rho: float, kappa: float, theta: 
     return S, v
 
 # -----------------------------
+# Persistent Model Saving and Loading
+# -----------------------------
+def save_flax_model(flax_model: FlaxNeuralNetwork) -> None:
+    from flax.serialization import to_bytes
+    with open(FLAX_MODEL_PATH, "wb") as f:
+        f.write(to_bytes(flax_model.params))
+    logger.info("Flax model parameters saved.")
+
+def load_flax_model(flax_model: FlaxNeuralNetwork) -> bool:
+    from flax.serialization import from_bytes
+    if os.path.exists(FLAX_MODEL_PATH):
+        with open(FLAX_MODEL_PATH, "rb") as f:
+            flax_model.params = from_bytes(flax_model.model.init(jax.random.PRNGKey(0), jnp.ones((1, flax_model.model.hidden_layers[0]))), f.read())
+        logger.info("Flax model parameters loaded.")
+        return True
+    return False
+
+def save_lightgbm_model(lgb_model: any) -> None:
+    lgb_model.save_model(LIGHTGBM_MODEL_PATH)
+    logger.info("LightGBM model saved.")
+
+def load_lightgbm_model() -> any:
+    if os.path.exists(LIGHTGBM_MODEL_PATH):
+        model = lgb.Booster(model_file=LIGHTGBM_MODEL_PATH)
+        logger.info("LightGBM model loaded.")
+        return model
+    return None
+
+def save_ensemble_config(blend_weight: float, sentiment_weight: float) -> None:
+    config = {"blend_weight": blend_weight, "sentiment_weight": sentiment_weight}
+    with open(ENSEMBLE_CONFIG_PATH, "w") as f:
+        json.dump(config, f)
+    logger.info("Ensemble configuration saved.")
+
+def load_ensemble_config() -> dict:
+    if os.path.exists(ENSEMBLE_CONFIG_PATH):
+        with open(ENSEMBLE_CONFIG_PATH, "r") as f:
+            config = json.load(f)
+        logger.info("Ensemble configuration loaded.")
+        return config
+    return {}
+
+# -----------------------------
+# Training Ensemble Models on Historical Data for a Universe of Tickers
+# -----------------------------
+async def train_ensemble_models(ticker_list: list[str]) -> tuple[FlaxNeuralNetwork, any, float]:
+    # Fetch data for each ticker concurrently
+    fetcher = DataFetcher()
+    tasks = [fetcher.async_fetch_stock_data(ticker) for ticker in ticker_list]
+    datasets = await asyncio.gather(*tasks, return_exceptions=True)
+    X_list = []
+    y_list = []
+    for df in datasets:
+        if isinstance(df, Exception) or df.empty:
+            continue
+        # Compute target: 4-day forward return
+        df = df.sort_index()
+        target = (df["Close"].shift(-4) / df["Close"] - 1).dropna()
+        features = extract_features(df).loc[target.index]
+        features = augment_features(features)
+        reduced = pca_reduce(features, n_components=10, mode="jax")
+        X_list.append(reduced.values)
+        y_list.append(target.values.reshape(-1, 1))
+    if not X_list:
+        raise ValueError("No valid training data obtained.")
+    X_train = np.concatenate(X_list, axis=0)
+    y_train = np.concatenate(y_list, axis=0)
+    # Train Flax Neural Network
+    flax_nn = FlaxNeuralNetwork(input_dim=X_train.shape[1], output_dim=1, dropout_rate=0.1, learning_rate=1e-3)
+    flax_nn.train(X_train, y_train, epochs=20, batch_size=32)
+    # Train LightGBM model
+    lgb_model = train_lightgbm(X_train, y_train)
+    # Optimize ensemble blend weight
+    blend_weight = optimize_ensemble_weight(X_train, y_train)
+    return flax_nn, lgb_model, blend_weight
+
+# -----------------------------
 # Async Celery Task for Ticker Processing and WebSocket Update
 # -----------------------------
 @celery_app.task
@@ -683,18 +786,34 @@ async def process_ticker(ticker: str) -> dict[str, any]:
         df = await fetcher.async_fetch_stock_data(ticker)
         if df.empty:
             raise ValueError("Fetched dataframe is empty.")
-        target = (df["Close"].shift(-4) / df["Close"] - 1).fillna(0)
+        df = df.sort_index()
+        # For prediction, we forecast the next 4-day return using the latest available features.
         features = extract_features(df)
-        augmented = augment_features(features)
-        # Choose PCA mode based on environment: "jax" for GPU or "joblib" for CPU
-        reduced = pca_reduce(augmented, n_components=10, mode="jax")
-        predictions = list(zip(reduced.index.tolist(), np.random.rand(len(reduced))))  # Dummy predictions
+        features = augment_features(features)
+        reduced = pca_reduce(features, n_components=10, mode="jax")
+        # Use only the most recent row for prediction.
+        X_pred = reduced.tail(1).values
+        # Load persistent models and configuration
+        # Flax model
+        global GLOBAL_ENSEMBLE_WEIGHT, GLOBAL_SENTIMENT_WEIGHT
+        flax_nn = FlaxNeuralNetwork(input_dim=X_pred.shape[1], output_dim=1)
+        if not load_flax_model(flax_nn):
+            raise ValueError("Flax model not available.")
+        # LightGBM model
+        lgb_model = load_lightgbm_model()
+        if lgb_model is None:
+            raise ValueError("LightGBM model not available.")
+        ensemble_config = load_ensemble_config()
+        if ensemble_config:
+            GLOBAL_ENSEMBLE_WEIGHT = ensemble_config.get("blend_weight", GLOBAL_ENSEMBLE_WEIGHT)
+            GLOBAL_SENTIMENT_WEIGHT = ensemble_config.get("sentiment_weight", GLOBAL_SENTIMENT_WEIGHT)
+        prediction = float(ensemble_predict(X_pred, flax_nn, lgb_model, GLOBAL_ENSEMBLE_WEIGHT)[0])
         latest_close = float(df["Close"].iloc[-1])
         strike = latest_close
         r_val = 0.01
         T_val = 4 / 252
         sigma_val = float(np.std(np.log(df["Close"]/df["Close"].shift(1)).dropna()) * math.sqrt(252))
-        # Launch option pricing concurrently
+        # Option pricing calculations
         option_task = asyncio.create_task(_fetch_option_prices(latest_close, strike, T_val, r_val, sigma_val))
         sentiment = await fetcher.fetch_news_sentiment(ticker)
         returns = np.log(df["Close"]/df["Close"].shift(1)).dropna().values
@@ -713,7 +832,7 @@ async def process_ticker(ticker: str) -> dict[str, any]:
             "Vega": calculate_option_greeks(latest_close, strike, T_val, r_val, sigma_val)[3],
             "Sentiment": sentiment,
             "CurrentRegime": regime,
-            "Predictions": predictions
+            "Prediction": prediction  # forecasted 4-day return
         }
         socketio.emit('ticker_update', result, broadcast=True)
         return result
@@ -722,10 +841,8 @@ async def process_ticker(ticker: str) -> dict[str, any]:
         return {}
 
 async def _fetch_option_prices(latest_close: float, strike: float, T: float, r: float, sigma: float) -> tuple[float, float, float]:
-    # Execute pricing models concurrently using asyncio.gather
     bs = asyncio.to_thread(OptionPricing.black_scholes, latest_close, strike, T, r, sigma, "call")
     binom = asyncio.to_thread(OptionPricing.binomial, latest_close, strike, T, r, sigma, 100, "call")
-    # Use the optimized parallel GPU Monte Carlo simulation
     mc = asyncio.to_thread(OptionPricing.monte_carlo_gpu_parallel, latest_close, strike, T, r, sigma, 10000, "call")
     return await asyncio.gather(bs, binom, mc)
 
@@ -742,14 +859,18 @@ def start_dashboard(metrics_data: dict[str, any]) -> None:
             dbc.Col(dbc.Card([dbc.CardHeader("Average Sentiment"),
                                dbc.CardBody(html.H4(id="avg-sent", children=str(metrics_data.get("avg_sent", "N/A"))))]), width=6)
         ]),
-        dcc.Interval(id="interval", interval=10*1000, n_intervals=0)
+        html.Div(id="live-update", style={"display": "none"}),
+        html.Script(src="https://cdn.socket.io/4.4.1/socket.io.min.js"),
+        html.Script("""
+            document.addEventListener('DOMContentLoaded', function() {
+                var socket = io();
+                socket.on('ticker_update', function(msg) {
+                    document.getElementById('avg-bs').innerHTML = msg.BS_Price;
+                    document.getElementById('avg-sent').innerHTML = msg.Sentiment;
+                });
+            });
+        """)
     ], fluid=True)
-    @app.callback(
-        [Output("avg-bs", "children"), Output("avg-sent", "children")],
-        [Input("interval", "n_intervals")]
-    )
-    def update_metrics(n: int) -> tuple[str, str]:
-        return (str(metrics_data.get("avg_bs", "N/A")), str(metrics_data.get("avg_sent", "N/A")))
     threading.Thread(target=lambda: socketio.run(flask_app, port=CONFIG["DASH_PORT"]), daemon=True).start()
     logger.info(f"Dashboard started at http://127.0.0.1:{CONFIG['DASH_PORT']}")
 
@@ -759,17 +880,13 @@ def start_dashboard(metrics_data: dict[str, any]) -> None:
 def build_prediction_table(results: list[dict[str, any]]) -> pd.DataFrame:
     rows = []
     for res in results:
-        if res.get("Predictions"):
-            pred_date, pred_val = res["Predictions"][-1]
-            if pred_val >= 10.0:
-                rows.append({
-                    "Date": pred_date.strftime("%Y-%m-%d") if isinstance(pred_date, datetime.datetime) else str(pred_date),
-                    "Ticker": res["Ticker"],
-                    "Strike": res["Strike"],
-                    "Predicted Increase (%)": pred_val * 100,
-                    "BS Price": res["BS_Price"],
-                    "Sentiment": res["Sentiment"]
-                })
+        if res.get("Prediction") is not None:
+            rows.append({
+                "Ticker": res["Ticker"],
+                "Predicted 4-day Return (%)": res["Prediction"] * 100,
+                "BS Price": res["BS_Price"],
+                "Sentiment": res["Sentiment"]
+            })
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 def plot_performance_metrics(results: list[dict[str, any]]) -> None:
@@ -792,7 +909,6 @@ def plot_performance_metrics(results: list[dict[str, any]]) -> None:
 async def async_process_tickers(tickers: list[str]) -> list[dict[str, any]]:
     results = []
     tasks = [process_ticker.delay(ticker) for ticker in tickers]
-    # Await Celery tasks asynchronously
     for task in tasks:
         try:
             result = await asyncio.to_thread(task.get, timeout=300)
@@ -801,13 +917,6 @@ async def async_process_tickers(tickers: list[str]) -> list[dict[str, any]]:
         except Exception as e:
             logger.error(f"Error processing ticker {ticker}: {e}")
     return results
-
-def train_models(sample_X: np.ndarray, sample_y: np.ndarray) -> float:
-    optimal_weight = optimize_ensemble_weight(sample_X, sample_y)
-    global GLOBAL_ENSEMBLE_WEIGHT
-    GLOBAL_ENSEMBLE_WEIGHT = optimal_weight
-    logger.info("Ensemble model training complete.")
-    return optimal_weight
 
 def validate_tickers(tickers: list[str]) -> list[str]:
     valid_tickers = []
@@ -821,7 +930,7 @@ def validate_tickers(tickers: list[str]) -> list[str]:
 async def async_main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--test", action="store_true", help="Run tests and exit")
-    parser.add_argument("--tickers", type=str, help="Comma-separated tickers")
+    parser.add_argument("--tickers", type=str, help="Comma-separated tickers for live processing (optional)")
     args = parser.parse_args()
 
     if args.test:
@@ -833,46 +942,53 @@ async def async_main() -> None:
         logger.error("This script is designed to run on Monday after 16:00. Exiting.")
         sys.exit(1)
 
-    tickers: list[str] = []
+    # Define the full ticker universe for initial training
+    default_tickers = ["AA", "AAL", "AAPL", "ABBV", "ABNB", "ABT", "ADBE", "AFRM", "AG", "AGNC", "ALLY", "AMAT", "AMD", "AMGN", "AMZN", "APA", "AR", "ASML", "AVGO", "AXP", "AZN", "BA", "BABA", "BAC", "BBWI", "BBY", "BHC", "BIDU", "BILI", "BMY", "BP", "BTU", "BX", "C", "CAG", "CAT", "CCJ", "CCL", "CF", "CHWY", "CLF", "CMCSA", "CMG", "COF", "COIN", "COP", "COST", "CPNG", "CRM", "CRSP", "CRWD", "CSCO", "CSTM", "CSX", "CTRA", "CVE", "CVNA", "CVS", "CVX", "CZR", "DAL", "DASH", "DB", "DDOG", "DE", "DG", "DHI", "DIS", "DKNG", "DLTR", "DOCU", "DOW", "DVN", "EBAY", "EDU", "ENPH", "EOG", "EPD", "EQT", "ET", "ETSY", "EXPE", "F", "FANG", "FCX", "FDX", "FSLR", "FSLY", "FUTU", "GE", "GILD", "GIS", "GLW", "GM", "GME", "GOLD", "GOOG", "GOOGL", "GS", "GSK", "HAL", "HD", "HL", "HON", "HOOD", "HPQ", "HSBC", "HUT", "IBM", "INTC", "ISRG", "JBLU", "JD", "JNJ", "JPM", "JWN", "KGC", "KHC", "KMI", "KO", "KR", "KSS", "LEN", "LI", "LLY", "LMND", "LMT", "LOW", "LRCX", "LULU", "LUMN", "LUV", "LVS", "LYFT", "M", "MA", "MARA", "MCD", "MDB", "MDLZ", "MDT", "META", "MGM", "MMM", "MO", "MOS", "MPC", "MRK", "MRNA", "MRVL", "MS", "MSFT", "MSTR", "MU", "NCLH", "NEE", "NEM", "NET", "NFLX", "NKE", "NLY", "NOW", "NU", "NUE", "NVAX", "NVDA", "NXPI", "OKTA", "ON", "ORCL", "OXY", "PANW", "PARA", "PBR", "PCG", "PDD", "PENN", "PEP", "PFE", "PG", "PINS", "PLTR", "PM", "PSX", "PTON", "PYPL", "QCOM", "QS", "RBLX", "RCL", "RH", "RIOT", "RIVN", "RKT", "ROKU", "RTX", "RUN", "SBUX", "SCHW", "SE", "SHEL", "SHOP", "SIRI", "SLB", "SNAP", "SNOW", "SOFI", "SPOT", "SQ", "STX", "SU", "T", "TDOC", "TECK", "TEVA", "TGT", "TJX", "TMUS", "TSLA", "TSM", "TTD", "TTWO", "TWLO", "TXN", "U", "UAL", "UBER", "UNH", "UNP", "UPS", "UPST", "USB", "V", "VALE", "VLO", "VOD", "VZ", "W", "WBA", "WBD", "WDAY", "WDC", "WFC", "WMT", "WPM", "WYNN", "X", "XOM", "XPEV", "Z", "ZIM", "ZM", "ZS"]
+
+    # Check if persistent models exist; if not, train ensemble models
+    models_exist = os.path.exists(FLAX_MODEL_PATH) and os.path.exists(LIGHTGBM_MODEL_PATH) and os.path.exists(ENSEMBLE_CONFIG_PATH)
+    if not models_exist:
+        logger.info("Persistent models not found. Starting training on historical data...")
+        try:
+            flax_nn, lgb_model, blend_weight = await train_ensemble_models(default_tickers)
+            # Optimize sentiment weight using sample texts (could be refined)
+            sample_texts = ["The market is looking bullish today.", "Stocks are plummeting in a bear market."]
+            sample_true_scores = [0.8, -0.7]
+            sentiment_weight = optimize_sentiment_weight(sample_texts, sample_true_scores)
+            global GLOBAL_ENSEMBLE_WEIGHT, GLOBAL_SENTIMENT_WEIGHT
+            GLOBAL_ENSEMBLE_WEIGHT = blend_weight
+            GLOBAL_SENTIMENT_WEIGHT = sentiment_weight
+            save_flax_model(flax_nn)
+            save_lightgbm_model(lgb_model)
+            save_ensemble_config(blend_weight, sentiment_weight)
+            logger.info("Ensemble model training and persistence complete.")
+        except Exception as e:
+            logger.exception(f"Training ensemble models failed: {e}")
+            sys.exit(1)
+    else:
+        logger.info("Persistent ensemble models found. Skipping training.")
+
+    # Process tickers for live prediction; use tickers provided via --tickers if any, otherwise use default list.
     if args.tickers:
         tickers = [t.strip() for t in args.tickers.split(",") if t.strip()]
     else:
-        tickers_input = input("Enter tickers (comma separated): ")
-        tickers = [t.strip() for t in tickers_input.split(",") if t.strip()]
-
+        tickers = default_tickers
     tickers = validate_tickers(tickers)
-    if not tickers:
-        logger.error("No valid tickers provided. Exiting.")
-        sys.exit(1)
-
-    # Auto-tune sentiment blend weight (sample texts and scores for demonstration)
-    sample_texts = ["The market is looking bullish today.", "Stocks are plummeting in a bear market."]
-    sample_true_scores = [0.8, -0.7]
-    global GLOBAL_SENTIMENT_WEIGHT
-    GLOBAL_SENTIMENT_WEIGHT = optimize_sentiment_weight(sample_texts, sample_true_scores)
-
     results = await async_process_tickers(tickers)
     if not results:
         logger.info("No predictions generated.")
         return
-
     prediction_table = build_prediction_table(results)
     if not prediction_table.empty:
         print("\nPrediction Table:")
         print(prediction_table.to_string(index=False))
     else:
         print("No significant predictions found.")
-
     plot_performance_metrics(results)
     avg_bs = np.mean([res["BS_Price"] for res in results if "BS_Price" in res])
     avg_sent = np.mean([res["Sentiment"] for res in results if "Sentiment" in res])
     metrics_data = {"avg_bs": avg_bs, "avg_sent": avg_sent}
     start_dashboard(metrics_data)
-
-    # Auto-tune ensemble blend weight on a sample dataset (for demonstration)
-    sample_X = np.random.rand(100, 10)
-    sample_y = np.random.rand(100, 1)
-    train_models(sample_X, sample_y)
     logger.info("Processing complete. Dashboard is live; press Ctrl+C to exit.")
     try:
         while True:
@@ -891,11 +1007,9 @@ def run_tests() -> None:
     a = np.array([1.0, 2.0, 3.0])
     b = np.array([1.0, 2.0, 3.0])
     assert abs(fast_cpu_distance(a, b)) < 1e-6, "fast_cpu_distance test failed."
-
     multi_gpu_accel = MultiGPUAccelerator()
     res_gpu = multi_gpu_accel.vector_multiply(a, b)
     assert np.allclose(res_gpu, a * b, atol=1e-5), "MultiGPU routine test failed."
-
     X_test = np.random.rand(5, 10)
     y_test = np.random.rand(5, 1)
     flax_nn = FlaxNeuralNetwork(input_dim=10, output_dim=1, dropout_rate=0.2, learning_rate=1e-3)
@@ -904,11 +1018,9 @@ def run_tests() -> None:
     g = grad(flax_nn.loss_fn)(params, (jnp.array(X_test), jnp.array(y_test)))
     for key in g:
         assert g[key] is not None, f"Gradient for {key} missing."
-
     st = SentimentTransformer()
     score = st.basic_score("This is a great day for trading!")
     assert isinstance(score, float), "Sentiment transformer test failed."
-
     df_sample = pd.DataFrame({
         "Close": np.linspace(100, 110, 30),
         "Volume": np.random.randint(1000, 5000, 30),
@@ -917,7 +1029,6 @@ def run_tests() -> None:
     }, index=pd.date_range("2020-01-01", periods=30))
     feats = extract_features(df_sample)
     assert not feats.empty, "Feature extraction test failed."
-
     call_counter = {"count": 0}
     @retry(Exception, tries=3, delay=0.1, backoff=1)
     def test_retry_success() -> str:
@@ -926,13 +1037,11 @@ def run_tests() -> None:
             raise ValueError("Failing")
         return "succeeded"
     assert test_retry_success() == "succeeded", "Retry decorator test failed."
-
     @profile
     def dummy_sleep() -> str:
         time.sleep(0.2)
         return "done"
     assert dummy_sleep() == "done", "Profiling decorator test failed."
-
     fetcher = DataFetcher()
     try:
         asyncio.run(fetcher.async_fetch_stock_data("INVALID_TICKER"))
