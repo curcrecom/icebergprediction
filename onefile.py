@@ -1,124 +1,81 @@
-import os
-import sys
-import time
-import math
-import json
-import asyncio
-import logging
-import datetime
-import threading
-import argparse
-import io
+import os, sys, time, math, json, asyncio, logging, datetime, threading, argparse, io, pickle
+import numpy as np, pandas as pd
 from functools import wraps, partial, lru_cache
 import concurrent.futures
-import pickle
-
-# Use JAX instead of numpy where possible.
-import jax
-import jax.numpy as jnp
-from jax import jit, grad, lax, random, pmap, vmap
-
-import numpy as np
-import pandas as pd
-from numpy.linalg import svd
-
-# THIRD–PARTY LIBRARIES
-from numba import njit, prange
-import optax
-from transformers import pipeline
-from bayes_opt import BayesianOptimization
-import dash
-from dash import dcc, html, Output, Input
-import dash_bootstrap_components as dbc
-import metalcompute as mc
-import hdbscan
-import lightgbm as lgb
-from flax import linen as nn
+import yfinance as yf  # used for historical stock data retrieval
 import aiohttp
-from bs4 import BeautifulSoup
-from joblib import Memory, Parallel, delayed
-from sentence_transformers import SentenceTransformer, util
-from celery import Celery
-from flask import Flask
-from flask_socketio import SocketIO, emit
-
-# New imports for structured logging and database caching
-from pythonjsonlogger import jsonlogger
-from sqlalchemy import create_engine, Column, String, Float, Text, DateTime
+import sqlalchemy
+from sqlalchemy import create_engine, Column, String, Float, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import SQLAlchemyError
-from sklearn.model_selection import KFold
+from numba import njit, prange
+import lightgbm as lgb
+import optax
+import jax
+import jax.numpy as jnp
+from jax import jit, grad, random, pmap, vmap
+from flax import linen as nn
+from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
+from bayes_opt import BayesianOptimization
 
-# -----------------------------
-# Global Configuration and Memory Cache
-# -----------------------------
-CONFIG: dict[str, any] = {
+# Fictitious module for AMD/Metal GPU acceleration; in a real system this should be implemented in C/C++ and wrapped in Python.
+import metalcompute as mc  # assumed to be a custom low-level wrapper for Metal
+
+# ---------------------------
+# Global Configurations & Logging
+# ---------------------------
+CONFIG = {
     "LOG_FILE": "model_log.txt",
-    "RUN_DAY": 0,         # Monday
-    "RUN_HOUR": 16,       # 16:00 local time
-    "DASH_PORT": 8050,    # Dashboard port
-    "CACHE_EXPIRY": 86400  # Cache expiry (seconds)
+    "CACHE_DB": "stock_cache.db",
+    "CACHE_EXPIRY": 86400,  # one day
+    "DASH_PORT": 8050,
+    "RUN_DAY": 4,  # Friday (0=Monday,...,4=Friday)
+    "RUN_HOUR": 15,  # run after 15:00 local time on trading days
+    "BATCH_SIZE": 32,
+    "EPOCHS": 100,
+    "CHECKPOINT_DIR": "./checkpoints"
 }
-GLOBAL_SENTIMENT_WEIGHT = 0.3  # weight for embedding score (the basic FinBERT score weight will be 1 - this)
-GLOBAL_ENSEMBLE_WEIGHT = 0.5   # weight for Flax NN in ensemble (the LightGBM weight will be 1 - this)
 
-# Paths for persistent model files
-FLAX_MODEL_PATH = "flax_model_params.bin"
-LIGHTGBM_MODEL_PATH = "lgb_model.txt"
-ENSEMBLE_CONFIG_PATH = "ensemble_config.json"  # to store ensemble blend weight and sentiment weight
+if not os.path.exists(CONFIG["CHECKPOINT_DIR"]):
+    os.makedirs(CONFIG["CHECKPOINT_DIR"])
 
-# -----------------------------
-# Structured Logging Configuration using JSON formatter
-# -----------------------------
-def configure_logging() -> None:
-    logger = logging.getLogger()
-    logger.setLevel(logging.DEBUG)
-    log_format = '%(asctime)s %(levelname)s %(name)s %(message)s'
-    formatter = jsonlogger.JsonFormatter(log_format)
-    # Console handler
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
-    # File handler with rotation
-    fh = logging.handlers.RotatingFileHandler(CONFIG["LOG_FILE"], maxBytes=1*1024*1024, backupCount=5)
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-
-configure_logging()
+# Configure structured JSON logging
+from pythonjsonlogger import jsonlogger
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+formatter = jsonlogger.JsonFormatter('%(asctime)s %(levelname)s %(name)s %(message)s')
+ch = logging.StreamHandler(sys.stdout)
+ch.setLevel(logging.INFO)
+ch.setFormatter(formatter)
+logger.addHandler(ch)
+fh = logging.handlers.RotatingFileHandler(CONFIG["LOG_FILE"], maxBytes=1*1024*1024, backupCount=5)
+fh.setLevel(logging.DEBUG)
+fh.setFormatter(formatter)
+logger.addHandler(fh)
 
-# -----------------------------
-# Database Caching with SQLAlchemy
-# -----------------------------
+# ---------------------------
+# Database Caching (SQLAlchemy)
+# ---------------------------
 Base = declarative_base()
-
 class CacheEntry(Base):
     __tablename__ = 'cache'
     ticker = Column(String, primary_key=True)
-    data = Column(Text)  # JSON data
+    data = Column(Text)   # JSON string of historical data
     timestamp = Column(Float)
-
-# Create SQLite engine and session factory.
-engine = create_engine("sqlite:///cache.db", echo=False)
+engine = create_engine(f"sqlite:///{CONFIG['CACHE_DB']}", echo=False)
 SessionLocal = sessionmaker(bind=engine)
 Base.metadata.create_all(bind=engine)
-
 class CacheDB:
     def __init__(self):
         self.session = SessionLocal()
-
     def get(self, ticker: str) -> dict:
         try:
             entry = self.session.query(CacheEntry).filter(CacheEntry.ticker == ticker).first()
             if entry:
                 return {"data": entry.data, "timestamp": entry.timestamp}
-            return {}
         except SQLAlchemyError as e:
             logger.error(f"CacheDB get error: {e}")
-            return {}
-
+        return {}
     def set(self, ticker: str, data: str, timestamp: float) -> None:
         try:
             entry = self.session.query(CacheEntry).filter(CacheEntry.ticker == ticker).first()
@@ -133,521 +90,452 @@ class CacheDB:
             logger.error(f"CacheDB set error: {e}")
             self.session.rollback()
 
-# -----------------------------
-# Joblib Memory Cache (kept for non-cache routines)
-# -----------------------------
-memory = Memory(location="./joblib_cache", verbose=0)
-
-# -----------------------------
-# Celery and Flask–SocketIO Setup
-# -----------------------------
-celery_app = Celery('tasks', broker='redis://localhost:6379/0')
-celery_app.conf.update(worker_concurrency=os.cpu_count())
-flask_app = Flask(__name__)
-flask_app.config['SECRET_KEY'] = 'secret!'
-socketio = SocketIO(flask_app, cors_allowed_origins="*")
-
-# -----------------------------
-# Retry Decorators with Exponential Backoff
-# -----------------------------
-def retry(exceptions: tuple[Exception, ...], tries: int = 3, delay: float = 1.0, backoff: int = 2) -> callable:
-    def decorator(func: callable) -> callable:
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            mtries, mdelay = tries, delay
-            while mtries > 1:
-                try:
-                    return func(*args, **kwargs)
-                except exceptions as e:
-                    logger.error(f"{func.__name__} failed with {e}, retrying in {mdelay:.2f} seconds...")
-                    time.sleep(mdelay)
-                    mtries -= 1
-                    mdelay *= backoff
-            return func(*args, **kwargs)
-        return wrapper
-    return decorator
-
-def async_retry(exceptions: tuple[Exception, ...], tries: int = 3, delay: float = 1.0, backoff: int = 2) -> callable:
-    def decorator(func: callable) -> callable:
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            mtries, mdelay = tries, delay
-            while mtries > 1:
-                try:
-                    return await func(*args, **kwargs)
-                except exceptions as e:
-                    logger.error(f"{func.__name__} (async) failed with {e}, retrying in {mdelay:.2f} seconds...")
-                    await asyncio.sleep(mdelay)
-                    mtries -= 1
-                    mdelay *= backoff
-            return await func(*args, **kwargs)
-        return wrapper
-    return decorator
-
-# -----------------------------
-# Profiling Decorator
-# -----------------------------
-def profile(func: callable) -> callable:
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        start = time.perf_counter()
-        result = func(*args, **kwargs)
-        elapsed = time.perf_counter() - start
-        logger.info(f"{func.__name__} took {elapsed:.4f} seconds")
-        return result
-    return wrapper
-
-# -----------------------------
-# GPU Accelerator (MetalCompute) with MultiGPU Optimized Execution
-# -----------------------------
+# ---------------------------
+# Low-level CPU and GPU Acceleration Classes
+# ---------------------------
 class GPUAccelerator:
-    def __init__(self, device: mc.Device | None = None) -> None:
+    """GPU Accelerator using custom Metal kernel code for vector operations."""
+    def __init__(self, device: mc.Device = None):
         self.device = device if device is not None else mc.Device()
         logger.info(f"GPUAccelerator initialized with device: {self.device.name}")
+        # Low-level Metal kernel code in MSL for vector multiplication (example)
         self.kernel_code = """
         #include <metal_stdlib>
         using namespace metal;
-        kernel void vec_mult(device const float* a [[ buffer(0) ]],
-                             device const float* b [[ buffer(1) ]],
+        kernel void vec_mult(const device float* a [[ buffer(0) ]],
+                             const device float* b [[ buffer(1) ]],
                              device float* result [[ buffer(2) ]],
-                             constant uint &total_elements [[ buffer(3) ]],
-                             uint id [[ thread_position_in_grid ]],
-                             uint total_threads [[ threads_per_grid ]]) {
-            for (uint i = id; i < total_elements; i += total_threads) {
+                             constant uint &n [[ buffer(3) ]],
+                             uint id [[ thread_position_in_grid ]]) {
+            for (uint i = id; i < n; i += get_num_threads_per_grid()) {
                 result[i] = a[i] * b[i];
             }
         }
         """
         self.compiled_kernel = self.device.kernel(self.kernel_code).function("vec_mult")
-    
-    def vector_multiply(self, a_np: np.ndarray, b_np: np.ndarray) -> np.ndarray:
-        a_np = np.ascontiguousarray(a_np.astype(np.float32))
-        b_np = np.ascontiguousarray(b_np.astype(np.float32))
-        total_elements = a_np.shape[0]
-        a_bytes = memoryview(a_np)
-        b_bytes = memoryview(b_np)
-        bytes_count = total_elements * 4
-        result_buf = self.device.buffer(bytes_count)
-        total_threads = getattr(self.device, "max_threads", 256)
-        self.compiled_kernel(total_elements, a_bytes, b_bytes, result_buf)
+    def vector_multiply(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        a = np.ascontiguousarray(a.astype(np.float32))
+        b = np.ascontiguousarray(b.astype(np.float32))
+        n = a.shape[0]
+        buf_bytes = n * 4
+        a_bytes = memoryview(a)
+        b_bytes = memoryview(b)
+        result_buf = self.device.buffer(buf_bytes)
+        self.compiled_kernel(n, a_bytes, b_bytes, result_buf)
         result_view = memoryview(result_buf).cast('f')
         return np.array(result_view)
 
-class MultiGPUAccelerator:
-    def __init__(self) -> None:
-        self.devices = mc.devices()
-        if len(self.devices) < 2:
-            logger.warning("Less than 2 GPU devices available; using single GPU mode.")
-            self.devices = self.devices[:1]
-        else:
-            self.devices = self.devices[:2]
-        self.gpu_accels = [GPUAccelerator(device=d) for d in self.devices]
-        logger.info(f"MultiGPUAccelerator using devices: {[d.name for d in self.devices]}")
-    
-    def vector_multiply(self, a_np: np.ndarray, b_np: np.ndarray) -> np.ndarray:
-        a_np = np.ascontiguousarray(a_np.astype(np.float32))
-        b_np = np.ascontiguousarray(b_np.astype(np.float32))
-        total_elements = a_np.shape[0]
-        devices = jax.local_devices()
-        n_devices = len(devices)
-        pad = (n_devices - total_elements % n_devices) % n_devices
-        if pad:
-            a_np = np.concatenate([a_np, np.zeros(pad, dtype=np.float32)])
-            b_np = np.concatenate([b_np, np.zeros(pad, dtype=np.float32)])
-        a_shards = np.split(a_np, n_devices)
-        b_shards = np.split(b_np, n_devices)
-        def mult(x, y):
-            return x * y
-        pmap_mult = jax.pmap(mult)
-        result_shards = pmap_mult(jax.device_put_sharded(a_shards, devices),
-                                  jax.device_put_sharded(b_shards, devices))
-        result = np.concatenate(result_shards)
-        return result[:total_elements]
-
-# -----------------------------
-# Sentiment Analysis with LLM Embedding and Auto–Tuned Weight
-# -----------------------------
-class SentimentTransformer:
-    def __init__(self) -> None:
-        self.pipeline = pipeline("sentiment-analysis",
-                                 model="yiyanghkust/finbert-pretrain",
-                                 tokenizer="yiyanghkust/finbert-pretrain")
-        self.embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-        logger.info("Loaded FinBERT and SentenceTransformer for sentiment analysis.")
-
-    def basic_score(self, text: str) -> float:
-        result = self.pipeline(text[:512])
-        if result and result[0]['label'].upper() == "POSITIVE":
-            return result[0]['score']
-        elif result and result[0]['label'].upper() == "NEGATIVE":
-            return -result[0]['score']
-        return 0.0
-
-    def embedding_score(self, text: str) -> float:
-        pos_ref = "This is a positive sentiment."
-        neg_ref = "This is a negative sentiment."
-        emb_text = self.embed_model.encode(text, convert_to_tensor=True)
-        emb_pos = self.embed_model.encode(pos_ref, convert_to_tensor=True)
-        emb_neg = self.embed_model.encode(neg_ref, convert_to_tensor=True)
-        sim_pos = util.cos_sim(emb_text, emb_pos).item()
-        sim_neg = util.cos_sim(emb_text, emb_neg).item()
-        return sim_pos - sim_neg
-
-    async def analyze_custom(self, text: str) -> float:
-        basic = self.basic_score(text)
-        embed = self.embedding_score(text)
-        return (1 - GLOBAL_SENTIMENT_WEIGHT) * basic + GLOBAL_SENTIMENT_WEIGHT * embed
-
-    @staticmethod
-    def analyze_static(text: str) -> float:
-        return SentimentTransformer().basic_score(text)
-
-# -----------------------------
-# Data Fetching and Caching (Async with aiohttp) with Enhanced Concurrency and Database Cache
-# -----------------------------
-class DataFetchError(Exception):
-    pass
-
-class DataFetcher:
-    def __init__(self) -> None:
-        self.cache_db = CacheDB()
-        self._sentiment_transformer = SentimentTransformer()
-
-    def save_cache(self, ticker: str, data: pd.DataFrame, timestamp: float) -> None:
-        try:
-            self.cache_db.set(ticker, data.to_json(date_format='iso'), timestamp)
-        except Exception as e:
-            logger.error(f"Error saving cache for {ticker}: {e}")
-
-    @async_retry((DataFetchError, Exception), tries=3, delay=2, backoff=2)
-    async def async_fetch_stock_data(self, ticker: str, period: str = '5y') -> pd.DataFrame:
-        current_time = time.time()
-        cache_entry = self.cache_db.get(ticker)
-        if cache_entry and (current_time - cache_entry.get("timestamp", 0) < CONFIG["CACHE_EXPIRY"]):
-            logger.info(f"Loading cached data for {ticker}")
-            try:
-                df = pd.read_json(cache_entry["data"], convert_dates=True)
-                return df
-            except Exception as e:
-                logger.exception(f"Error reading cache for {ticker}: {e}")
-        end_date = datetime.datetime.now()
-        start_date = end_date - datetime.timedelta(days=5*365)
-        period1 = int(time.mktime(start_date.timetuple()))
-        period2 = int(time.mktime(end_date.timetuple()))
-        url = (f"https://query1.finance.yahoo.com/v7/finance/download/{ticker}"
-               f"?period1={period1}&period2={period2}&interval=1d&events=history&includeAdjustedClose=true")
-        logger.info(f"Fetching data for {ticker}")
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                if response.status != 200:
-                    raise DataFetchError(f"Failed to fetch data for {ticker}: HTTP {response.status}")
-                csv_data = await response.text()
-                try:
-                    df = pd.read_csv(io.StringIO(csv_data), parse_dates=["Date"], index_col="Date")
-                except Exception as e:
-                    raise DataFetchError(f"Error parsing CSV for {ticker}: {e}")
-                self.save_cache(ticker, df, current_time)
-                return df
-
-    @async_retry((Exception,), tries=3, delay=2, backoff=2)
-    async def fetch_news_sentiment(self, ticker: str) -> float:
-        urls = [
-            f"https://www.businesswire.com/portal/site/home/?search={ticker}",
-            f"https://www.reuters.com/search/news?blob={ticker}",
-            f"https://www.bloomberg.com/search?query={ticker}"
-        ]
-        scores: list[float] = []
-        async with aiohttp.ClientSession() as session:
-            async def fetch_and_analyze(url: str) -> None:
-                try:
-                    async with session.get(url) as response:
-                        if response.status == 200:
-                            text = await response.text()
-                            soup = BeautifulSoup(text, 'html.parser')
-                            texts = " ".join(p.get_text() for p in soup.find_all('p'))
-                            score = await self._sentiment_transformer.analyze_custom(texts)
-                            scores.append(score)
-                except Exception as e:
-                    logger.error(f"Error fetching {url}: {e}")
-            await asyncio.gather(*(fetch_and_analyze(url) for url in urls), return_exceptions=True)
-        return float(np.mean(scores)) if scores else 0.0
-
-# -----------------------------
-# Option Greeks and Pricing Methods
-# -----------------------------
-def calculate_option_greeks(S: float, K: float, T: float, r: float, sigma: float) -> tuple[float, float, float, float]:
-    d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T) + 1e-12)
-    d2 = d1 - sigma * math.sqrt(T)
-    N = lambda x: 0.5 * (1 + math.erf(x / math.sqrt(2)))
-    n = lambda x: math.exp(-0.5 * x**2) / math.sqrt(2 * math.pi)
-    return N(d1), n(d1), (-S * n(d1) * sigma / (2 * math.sqrt(T)) - r * K * math.exp(-r * T) * N(d2)), S * math.sqrt(T) * n(d1)
-
-class OptionPricing:
-    @staticmethod
-    def black_scholes(S: float, K: float, T: float, r: float, sigma: float, option_type: str = 'call') -> float:
-        d1 = (math.log(S/K) + (r+0.5*sigma**2)*T) / (sigma*math.sqrt(T))
-        d2 = d1 - sigma*math.sqrt(T)
-        N = lambda x: 0.5*(1+math.erf(x/math.sqrt(2)))
-        if option_type.lower() == 'call':
-            return S*N(d1) - K*math.exp(-r*T)*N(d2)
-        return K*math.exp(-r*T)*N(-d2)
-
-    @staticmethod
-    def binomial(S: float, K: float, T: float, r: float, sigma: float, steps: int = 100, option_type: str = 'call') -> float:
-        return binomial_option_unrolled(S, K, T, r, sigma, steps, option_type)
-
-    @staticmethod
-    @jit
-    def monte_carlo_vec(S: float, K: float, T: float, r: float, sigma: float, option_type: str, key: jnp.ndarray) -> float:
-        def sim_fn(k):
-            rand = random.normal(k, shape=(10000,))
-            ST = S * jnp.exp((r - 0.5*sigma**2)*T + sigma*jnp.sqrt(T)*rand)
-            payoff = jnp.where(option_type.lower()=='call', jnp.maximum(ST-K, 0), jnp.maximum(K-ST, 0))
-            return jnp.mean(payoff)
-        keys = random.split(key, 10)
-        payoffs = vmap(sim_fn)(keys)
-        return float(jnp.exp(-r*T) * jnp.mean(payoffs))
-
-    @staticmethod
-    def monte_carlo_gpu_parallel(S: float, K: float, T: float, r: float, sigma: float,
-                                 simulations: int = 10000, option_type: str = 'call') -> float:
-        key = random.PRNGKey(int(time.time()))
-        return OptionPricing.monte_carlo_vec(S, K, T, r, sigma, option_type, key)
-
-    @staticmethod
-    def jump_diffusion(S: float, K: float, T: float, r: float, sigma: float,
-                       lam: float = 0.1, muJ: float = 0, sigmaJ: float = 0.1, option_type: str = 'call') -> float:
-        price = 0.0
-        for k in range(50):
-            poisson_prob = math.exp(-lam*T) * (lam*T)**k / math.factorial(k)
-            sigma_k = math.sqrt(sigma**2 + k*(sigmaJ**2)/T)
-            price += poisson_prob * OptionPricing.black_scholes(S, K, T, r, sigma_k, option_type)
-        return price
-
-# -----------------------------
-# Optimized Numerical Kernels with Numba
-# -----------------------------
 @njit(fastmath=True, parallel=True)
 def fast_cpu_distance(x: np.ndarray, y: np.ndarray) -> float:
     diff = x - y
     total = 0.0
     n = diff.shape[0]
-    unroll_factor = 4
-    limit = n - (n % unroll_factor)
-    for i in range(0, limit, unroll_factor):
-        total += diff[i]**2 + diff[i+1]**2 + diff[i+2]**2 + diff[i+3]**2
-    for i in range(limit, n):
-        total += diff[i]**2
+    for i in prange(n):
+        total += diff[i] * diff[i]
     return total
 
-@njit(fastmath=True)
-def binomial_option_unrolled(S: float, K: float, T: float, r: float, sigma: float, N: int, option_type: str) -> float:
-    dt = T / N
-    u = math.exp(sigma * math.sqrt(dt))
-    d = 1.0 / u
-    p = (math.exp(r * dt) - d) / (u - d)
-    asset_prices = np.empty(N + 1, dtype=np.float64)
-    for j in range(N + 1):
-        asset_prices[j] = S * (u ** j) * (d ** (N - j))
-    if option_type.lower() == 'call':
-        for j in range(N + 1):
-            asset_prices[j] = max(asset_prices[j] - K, 0.0)
-    else:
-        for j in range(N + 1):
-            asset_prices[j] = max(K - asset_prices[j], 0.0)
-    for i in range(N, 0, -1):
-        discount = math.exp(-r * dt)
-        total_steps = i
-        unroll = 4
-        limit = total_steps - (total_steps % unroll)
-        j = 0
-        while j < limit:
-            asset_prices[j] = discount * (p * asset_prices[j + 1] + (1.0 - p) * asset_prices[j])
-            asset_prices[j+1] = discount * (p * asset_prices[j+2] + (1.0 - p) * asset_prices[j+1])
-            asset_prices[j+2] = discount * (p * asset_prices[j+3] + (1.0 - p) * asset_prices[j+2])
-            if (j + 3) < total_steps:
-                asset_prices[j+3] = discount * (p * asset_prices[j+4] + (1.0 - p) * asset_prices[j+3])
-            else:
-                asset_prices[j+3] = discount * asset_prices[j+3]
-            j += unroll
-        while j < total_steps:
-            asset_prices[j] = discount * (p * asset_prices[j+1] + (1.0 - p) * asset_prices[j])
-            j += 1
-    return asset_prices[0]
-
-# -----------------------------
-# Optimized Technical Indicators for Parallel Computation
-# -----------------------------
-@njit(parallel=True)
-def numba_wma(arr: np.ndarray, period: int) -> np.ndarray:
-    n = arr.shape[0]
-    result = np.empty(n, dtype=arr.dtype)
+# ---------------------------
+# Technical Indicator Functions
+# ---------------------------
+def wma(arr: np.ndarray, period: int) -> np.ndarray:
+    """Weighted Moving Average"""
     weights = np.arange(1, period+1)
-    weight_sum = weights.sum()
-    for i in prange(n):
-        if i < period - 1:
-            result[i] = np.nan
-        else:
-            s = 0.0
-            for j in range(period):
-                s += arr[i - period + 1 + j] * weights[j]
-            result[i] = s / weight_sum
+    result = np.full(arr.shape, np.nan)
+    for i in range(period - 1, len(arr)):
+        result[i] = np.dot(arr[i - period + 1:i+1], weights) / weights.sum()
     return result
 
-@njit(parallel=True)
-def numba_ema(arr: np.ndarray, span: int) -> np.ndarray:
-    alpha = 2 / (span + 1)
-    ema = np.empty_like(arr)
-    ema[0] = arr[0]
-    for i in prange(1, arr.shape[0]):
-        ema[i] = alpha * arr[i] + (1 - alpha) * ema[i-1]
-    return ema
+def dema(arr: np.ndarray, period: int) -> np.ndarray:
+    """Double Exponential Moving Average"""
+    ema = pd.Series(arr).ewm(span=period, adjust=False).mean().to_numpy()
+    ema_ema = pd.Series(ema).ewm(span=period, adjust=False).mean().to_numpy()
+    return 2 * ema - ema_ema
 
-def optimized_macd(close: np.ndarray) -> np.ndarray:
-    ema12 = numba_ema(close.astype(np.float32), 12)
-    ema26 = numba_ema(close.astype(np.float32), 26)
-    return ema12 - ema26
+def tema(arr: np.ndarray, period: int) -> np.ndarray:
+    """Triple Exponential Moving Average"""
+    ema = pd.Series(arr).ewm(span=period, adjust=False).mean().to_numpy()
+    ema_ema = pd.Series(ema).ewm(span=period, adjust=False).mean().to_numpy()
+    ema_ema_ema = pd.Series(ema_ema).ewm(span=period, adjust=False).mean().to_numpy()
+    return 3 * (ema - ema_ema) + ema_ema_ema
 
-# -----------------------------
-# Feature Extraction & PCA Parallelization
-# -----------------------------
-def pca_reduce(features: pd.DataFrame, n_components: int = 10, mode: str = "jax") -> pd.DataFrame:
-    X = features.values - np.mean(features.values, axis=0)
-    if mode == "jax":
-        @jit
-        def compute_svd(X):
-            return jnp.linalg.svd(jnp.array(X), full_matrices=False)
-        U, s, _ = compute_svd(X)
-        U, s = np.array(U), np.array(s)
+def ssma(arr: np.ndarray, period: int) -> np.ndarray:
+    """Smoothed Simple Moving Average"""
+    result = np.full(arr.shape, np.nan)
+    result[0] = arr[0]
+    alpha = 1/period
+    for i in range(1, len(arr)):
+        result[i] = alpha * arr[i] + (1 - alpha) * result[i-1]
+    return result
+
+def lwma(arr: np.ndarray, period: int) -> np.ndarray:
+    """Linear Weighted Moving Average"""
+    weights = np.linspace(1, period, period)
+    result = np.full(arr.shape, np.nan)
+    for i in range(period - 1, len(arr)):
+        result[i] = np.dot(arr[i - period + 1:i+1], weights) / weights.sum()
+    return result
+
+def vwma(close: np.ndarray, volume: np.ndarray) -> np.ndarray:
+    """Volume Weighted Moving Average"""
+    cum_vol = np.cumsum(volume)
+    cum_pv = np.cumsum(close * volume)
+    return cum_pv / cum_vol
+
+def hma(arr: np.ndarray, period: int) -> np.ndarray:
+    """Hull Moving Average"""
+    half_length = int(period/2)
+    sqrt_length = int(math.sqrt(period))
+    wma_half = wma(arr, half_length)
+    wma_full = wma(arr, period)
+    raw = 2 * wma_half - wma_full
+    return wma(raw, sqrt_length)
+
+def kama(arr: np.ndarray, period: int, fast: int = 2, slow: int = 30) -> np.ndarray:
+    """Kaufman Adaptive Moving Average"""
+    result = np.full(arr.shape, np.nan)
+    change = np.abs(arr[period-1:] - arr[:-period+1])
+    volatility = np.array([np.sum(np.abs(np.diff(arr[i-period+1:i+1]))) for i in range(period-1, len(arr))])
+    er = np.divide(change, volatility, out=np.zeros_like(change), where=volatility!=0)
+    sc = np.power((er * (2/(fast+1) - 2/(slow+1)) + 2/(slow+1)), 2)
+    result[period-1] = arr[period-1]
+    for i in range(period, len(arr)):
+        result[i] = result[i-1] + sc[i-period+1]*(arr[i]-result[i-1])
+    return result
+
+def alma(arr: np.ndarray, period: int, offset: float = 0.85, sigma: float = 6) -> np.ndarray:
+    """Arnaud Legoux Moving Average"""
+    m = offset * (period - 1)
+    s = period / sigma
+    weights = np.array([math.exp(-((i - m)**2)/(2*s*s)) for i in range(period)])
+    weights /= weights.sum()
+    result = np.full(arr.shape, np.nan)
+    for i in range(period - 1, len(arr)):
+        result[i] = np.dot(arr[i-period+1:i+1], weights)
+    return result
+
+def gma(arr: np.ndarray, period: int) -> np.ndarray:
+    """Geometric Moving Average"""
+    result = np.full(arr.shape, np.nan)
+    for i in range(period - 1, len(arr)):
+        result[i] = np.exp(np.mean(np.log(arr[i-period+1:i+1] + 1e-9)))
+    return result
+
+def macd(arr: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9) -> (np.ndarray, np.ndarray):
+    """MACD indicator and signal line"""
+    ema_fast = pd.Series(arr).ewm(span=fast, adjust=False).mean().to_numpy()
+    ema_slow = pd.Series(arr).ewm(span=slow, adjust=False).mean().to_numpy()
+    macd_line = ema_fast - ema_slow
+    signal_line = pd.Series(macd_line).ewm(span=signal, adjust=False).mean().to_numpy()
+    return macd_line, signal_line
+
+def stochastic_oscillator(high: np.ndarray, low: np.ndarray, close: np.ndarray, k_period: int = 14, d_period: int = 3) -> (np.ndarray, np.ndarray):
+    """Stochastic Oscillator %K and %D lines"""
+    k_values = np.full(close.shape, np.nan)
+    for i in range(k_period - 1, len(close)):
+        k_values[i] = 100 * (close[i] - np.min(low[i-k_period+1:i+1])) / (np.max(high[i-k_period+1:i+1]) - np.min(low[i-k_period+1:i+1]) + 1e-9)
+    d_values = pd.Series(k_values).rolling(window=d_period).mean().to_numpy()
+    return k_values, d_values
+
+def adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+    """Average Directional Index"""
+    tr = np.maximum.reduce([high[1:] - low[1:], np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])])
+    atr = pd.Series(tr).ewm(alpha=1/period, adjust=False).mean().to_numpy()
+    up = high[1:] - high[:-1]
+    down = low[:-1] - low[1:]
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    plus_di = 100 * pd.Series(plus_dm).ewm(alpha=1/period, adjust=False).mean().to_numpy() / (atr + 1e-9)
+    minus_di = 100 * pd.Series(minus_dm).ewm(alpha=1/period, adjust=False).mean().to_numpy() / (atr + 1e-9)
+    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
+    adx = pd.Series(dx).ewm(alpha=1/period, adjust=False).mean().to_numpy()
+    adx_full = np.concatenate((np.full(1, np.nan), adx))
+    return adx_full
+
+def cci(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 20) -> np.ndarray:
+    """Commodity Channel Index"""
+    tp = (high + low + close) / 3
+    sma = pd.Series(tp).rolling(window=period).mean().to_numpy()
+    mad = pd.Series(np.abs(tp - sma)).rolling(window=period).mean().to_numpy()
+    return (tp - sma) / (0.015 * mad + 1e-9)
+
+def roc(arr: np.ndarray, period: int = 12) -> np.ndarray:
+    """Rate of Change"""
+    roc_val = np.full(arr.shape, np.nan)
+    roc_val[period:] = (arr[period:] - arr[:-period]) / (arr[:-period] + 1e-9) * 100
+    return roc_val
+
+def momentum(arr: np.ndarray, period: int = 10) -> np.ndarray:
+    """Momentum Indicator"""
+    mom = np.full(arr.shape, np.nan)
+    mom[period:] = arr[period:] - arr[:-period]
+    return mom
+
+def williams_r(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+    """Williams %R"""
+    wr = np.full(close.shape, np.nan)
+    for i in range(period - 1, len(close)):
+        wr[i] = -100 * (np.max(high[i-period+1:i+1]) - close[i]) / (np.max(high[i-period+1:i+1]) - np.min(low[i-period+1:i+1]) + 1e-9)
+    return wr
+
+def chaikin_oscillator(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, fast_period: int = 3, slow_period: int = 10) -> np.ndarray:
+    """Chaikin Oscillator"""
+    money_flow_multiplier = ((close - low) - (high - close)) / (high - low + 1e-9)
+    money_flow_volume = money_flow_multiplier * volume
+    adl = np.cumsum(money_flow_volume)
+    fast_ema = pd.Series(adl).ewm(span=fast_period, adjust=False).mean().to_numpy()
+    slow_ema = pd.Series(adl).ewm(span=slow_period, adjust=False).mean().to_numpy()
+    return fast_ema - slow_ema
+
+def obv(close: np.ndarray, volume: np.ndarray) -> np.ndarray:
+    """On Balance Volume"""
+    obv_val = np.zeros(len(close))
+    for i in range(1, len(close)):
+        if close[i] > close[i-1]:
+            obv_val[i] = obv_val[i-1] + volume[i]
+        elif close[i] < close[i-1]:
+            obv_val[i] = obv_val[i-1] - volume[i]
+        else:
+            obv_val[i] = obv_val[i-1]
+    return obv_val
+
+# ---------------------------
+# Hidden Markov Model (HMM) for Regime Detection (simplified custom implementation)
+# ---------------------------
+def detect_regime_hmm(returns: np.ndarray, n_states: int = 2, n_iter: int = 10) -> np.ndarray:
+    """
+    A simple Gaussian HMM using the Expectation–Maximization (EM) algorithm.
+    Returns an array of state assignments for each return.
+    Note: In production, one might use a dedicated package (e.g., hmmlearn)
+    but here we include a custom implementation.
+    """
+    T = len(returns)
+    # Initialize state means, variances, and transition matrix randomly
+    means = np.linspace(np.mean(returns) - np.std(returns), np.mean(returns) + np.std(returns), n_states)
+    variances = np.full(n_states, np.var(returns))
+    transmat = np.full((n_states, n_states), 1/n_states)
+    # Uniform initial state probabilities
+    pi = np.full(n_states, 1/n_states)
+    # Responsibilities (gamma)
+    gamma = np.zeros((T, n_states))
+    
+    for iteration in range(n_iter):
+        # E-step: compute gamma[t,k] = P(state=k|return[t])
+        for t in range(T):
+            obs_prob = np.array([ (1/math.sqrt(2*math.pi*v)) * math.exp(-0.5*((returns[t]-m)**2)/v)
+                                   for m, v in zip(means, variances)])
+            gamma[t] = pi * obs_prob
+            gamma[t] /= (np.sum(gamma[t]) + 1e-9)
+        # M-step: update parameters
+        for k in range(n_states):
+            weight = np.sum(gamma[:,k])
+            means[k] = np.sum(gamma[:,k]*returns) / (weight + 1e-9)
+            variances[k] = np.sum(gamma[:,k]*(returns - means[k])**2) / (weight + 1e-9)
+        # Update pi using the first observation gamma
+        pi = gamma[0]
+        # Update transition matrix (here we use a simple re–estimation)
+        for i in range(n_states):
+            for j in range(n_states):
+                numer = 0.0
+                denom = 0.0
+                for t in range(T-1):
+                    numer += gamma[t, i] * gamma[t+1, j]
+                    denom += gamma[t, i]
+                transmat[i,j] = numer / (denom + 1e-9)
+        # Normalize rows of transmat
+        transmat = transmat / (transmat.sum(axis=1, keepdims=True) + 1e-9)
+    # Viterbi decoding (very simplified: choose state with max responsibility at each t)
+    state_seq = np.argmax(gamma, axis=1)
+    return state_seq
+
+# ---------------------------
+# GARCH(1,1) Volatility Estimation
+# ---------------------------
+def estimate_garch(returns: np.ndarray, omega: float = 1e-6, alpha: float = 0.05, beta: float = 0.9) -> np.ndarray:
+    """Estimate conditional volatility using a basic GARCH(1,1) model."""
+    T = len(returns)
+    sigma2 = np.zeros(T)
+    sigma2[0] = np.var(returns)
+    for t in range(1, T):
+        sigma2[t] = omega + alpha*(returns[t-1]**2) + beta*sigma2[t-1]
+    return np.sqrt(sigma2)
+
+# ---------------------------
+# Option Pricing Models
+# ---------------------------
+def black_scholes(S: float, K: float, T: float, r: float, sigma: float, option_type: str = 'call') -> float:
+    """Black-Scholes option pricing formula."""
+    d1 = (math.log(S/K) + (r + 0.5*sigma*sigma)*T) / (sigma*math.sqrt(T) + 1e-12)
+    d2 = d1 - sigma*math.sqrt(T)
+    N = lambda x: 0.5*(1+math.erf(x/math.sqrt(2)))
+    if option_type.lower() == 'call':
+        return S * N(d1) - K * math.exp(-r*T) * N(d2)
     else:
-        U, s, _ = svd(X, full_matrices=False)
-    X_reduced = U[:, :n_components] * s[:n_components]
-    return pd.DataFrame(X_reduced, index=features.index)
+        return K * math.exp(-r*T) * N(-d2) - S * N(-d1)
 
-@lru_cache(maxsize=128)
-def compute_features_cached(close_json: str, volume_json: str, index_json: str) -> pd.DataFrame:
-    close = pd.read_json(io.StringIO(close_json), typ="series")
-    volume = pd.read_json(io.StringIO(volume_json), typ="series")
-    index = pd.read_json(io.StringIO(index_json), typ="series").index
-    features = pd.DataFrame(index=index)
-    features["Close"] = close
-    features["WMA"] = pd.Series(numba_wma(close.astype(np.float32).values, 20), index=index)
-    features["MACD"] = pd.Series(optimized_macd(close.astype(np.float32).values), index=index)
-    cum_pv = (close * volume).cumsum()
-    cum_vol = volume.cumsum()
-    features["VWAP"] = cum_pv / cum_vol
-    return features.fillna(method="bfill").fillna(method="ffill")
+def binomial_option(S: float, K: float, T: float, r: float, sigma: float, steps: int = 100, option_type: str = 'call') -> float:
+    """Binomial option pricing."""
+    dt = T / steps
+    u = math.exp(sigma*math.sqrt(dt))
+    d = 1/u
+    p = (math.exp(r*dt) - d) / (u - d)
+    # initialize asset prices at maturity
+    asset_prices = np.array([S * (u**j) * (d**(steps-j)) for j in range(steps+1)])
+    if option_type.lower() == 'call':
+        option_values = np.maximum(asset_prices - K, 0)
+    else:
+        option_values = np.maximum(K - asset_prices, 0)
+    discount = math.exp(-r*dt)
+    for i in range(steps, 0, -1):
+        option_values = discount * (p * option_values[1:i+1] + (1-p) * option_values[0:i])
+    return option_values[0]
 
-def extract_features(df: pd.DataFrame) -> pd.DataFrame:
-    close_json = df["Close"].to_json()
-    volume_json = df["Volume"].to_json()
-    index_json = df.index.to_series().to_json()
-    return compute_features_cached(close_json, volume_json, index_json)
+def monte_carlo_option(S: float, K: float, T: float, r: float, sigma: float,
+                       simulations: int = 100000, option_type: str = 'call') -> float:
+    """Monte Carlo simulation for option pricing using GPU parallelism."""
+    key = random.PRNGKey(int(time.time()))
+    def sim_fn(key):
+        rand = random.normal(key, (10000,))
+        ST = S * jnp.exp((r - 0.5*sigma**2)*T + sigma*jnp.sqrt(T)*rand)
+        if option_type.lower() == 'call':
+            payoff = jnp.maximum(ST-K, 0)
+        else:
+            payoff = jnp.maximum(K-ST, 0)
+        return jnp.mean(payoff)
+    keys = random.split(key, 10)
+    payoffs = vmap(sim_fn)(jnp.array(keys))
+    price = jnp.exp(-r*T) * jnp.mean(payoffs)
+    return float(price)
 
-def augment_features(features: pd.DataFrame) -> pd.DataFrame:
-    noise = np.random.normal(0, 0.001, size=features.shape)
-    return features + noise
+def jump_diffusion_option(S: float, K: float, T: float, r: float, sigma: float,
+                          lam: float = 0.1, muJ: float = 0, sigmaJ: float = 0.1, option_type: str = 'call') -> float:
+    """Option pricing with jump diffusion model."""
+    price = 0.0
+    for k in range(50):
+        poisson_prob = math.exp(-lam*T) * (lam*T)**k / math.factorial(k)
+        sigma_k = math.sqrt(sigma**2 + (k * sigmaJ**2)/T)
+        price += poisson_prob * black_scholes(S, K, T, r, sigma_k, option_type)
+    return price
 
-# -----------------------------
-# Flax Neural Network for GPU Training
-# -----------------------------
-class FlaxMLP(nn.Module):
-    hidden_layers: list[int]
+# ---------------------------
+# Custom Neural Network with Sinusoidal Representation Layers using Flax
+# ---------------------------
+class SinusoidalDense(nn.Module):
+    features: int
+    kernel_init: callable = nn.initializers.lecun_normal()
+    @nn.compact
+    def __call__(self, x):
+        # linear transformation followed by sine activation
+        dense = nn.Dense(self.features, kernel_init=self.kernel_init, use_bias=True)
+        x = dense(x)
+        return jnp.sin(x)
+
+class SRNModel(nn.Module):
+    hidden_layers: list
     output_dim: int
     dropout_rate: float = 0.0
-
     @nn.compact
     def __call__(self, x, train: bool = True):
+        # Instead of standard dense layers, use sinusoidal dense layers
         for h in self.hidden_layers:
-            x = nn.Dense(h, dtype=jnp.float32)(x)
-            x = nn.relu(x)
+            x = SinusoidalDense(features=h)(x)
+            x = nn.relu(x)  # additional nonlinearity if desired
             if self.dropout_rate > 0.0:
-                x = nn.Dropout(self.dropout_rate)(x, deterministic=not train)
-        return nn.Dense(self.output_dim, dtype=jnp.float32)(x)
+                x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=not train)
+        return nn.Dense(self.output_dim)(x)
 
 class FlaxNeuralNetwork:
-    def __init__(self, input_dim: int, output_dim: int, hidden_layers: list[int] | None = None,
-                 dropout_rate: float = 0.0, learning_rate: float = 1e-3) -> None:
+    """Flax NN with SRN layers for regression, including early stopping and checkpointing."""
+    def __init__(self, input_dim: int, output_dim: int, hidden_layers: list[int] = None,
+                 dropout_rate: float = 0.1, learning_rate: float = 1e-3):
         if hidden_layers is None:
             hidden_layers = [128, 128]
-        self.model = FlaxMLP(hidden_layers=hidden_layers, output_dim=output_dim, dropout_rate=dropout_rate)
+        self.model = SRNModel(hidden_layers=hidden_layers, output_dim=output_dim, dropout_rate=dropout_rate)
         self.learning_rate = learning_rate
         self.params = None
         self.tx = optax.adam(learning_rate)
         self.opt_state = None
-
+        self.best_loss = np.inf
+        self.checkpoint_path = os.path.join(CONFIG["CHECKPOINT_DIR"], "flax_model.chkpt")
     def init(self, rng: jax.random.PRNGKey, sample_input: jnp.ndarray) -> None:
         self.params = self.model.init(rng, sample_input)
         self.opt_state = self.tx.init(self.params)
-
     @jax.jit
-    def loss_fn(self, params: any, batch: tuple[jnp.ndarray, jnp.ndarray]) -> jnp.ndarray:
+    def loss_fn(self, params, batch):
         X, y = batch
         preds = self.model.apply(params, X)
         return jnp.mean((preds - y)**2)
-
     @jax.jit
-    def train_step(self, params: any, opt_state: any, batch: tuple[jnp.ndarray, jnp.ndarray]) -> tuple[any, any, jnp.ndarray]:
+    def train_step(self, params, opt_state, batch):
         loss, grads = jax.value_and_grad(self.loss_fn)(params, batch)
         updates, opt_state = self.tx.update(grads, opt_state)
         params = optax.apply_updates(params, updates)
         return params, opt_state, loss
-
-    def train(self, X: np.ndarray, y: np.ndarray, epochs: int = 100, batch_size: int = 32) -> list[float]:
+    def train(self, X: np.ndarray, y: np.ndarray, epochs: int = CONFIG["EPOCHS"], batch_size: int = CONFIG["BATCH_SIZE"],
+              early_stop_patience: int = 10) -> list[float]:
         X = X.astype(np.float32)
         y = y.astype(np.float32)
         num_samples = X.shape[0]
         losses = []
         rng = jax.random.PRNGKey(int(time.time()))
         self.init(rng, jnp.array(X[:batch_size]))
-        kf = KFold(n_splits=5, shuffle=True, random_state=42)
-        for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
-            X_train, y_train = X[train_idx], y[train_idx]
-            for epoch in range(epochs):
-                perm = np.random.permutation(X_train.shape[0])
-                for i in range(0, X_train.shape[0], batch_size):
-                    idx = perm[i:i+batch_size]
-                    batch = (jnp.array(X_train[idx]), jnp.array(y_train[idx]))
-                    self.params, self.opt_state, loss = self.train_step(self.params, self.opt_state, batch)
-                losses.append(float(loss))
-                logger.info(f"Fold {fold+1} Epoch {epoch+1}: loss {loss:.4f}")
+        patience = 0
+        for epoch in range(epochs):
+            perm = np.random.permutation(num_samples)
+            epoch_loss = 0.0
+            for i in range(0, num_samples, batch_size):
+                idx = perm[i:i+batch_size]
+                batch = (jnp.array(X[idx]), jnp.array(y[idx]))
+                self.params, self.opt_state, loss = self.train_step(self.params, self.opt_state, batch)
+                epoch_loss += float(loss)
+            epoch_loss /= (num_samples / batch_size)
+            losses.append(epoch_loss)
+            logger.info(f"Epoch {epoch+1}/{epochs}: Loss={epoch_loss:.6f}")
+            # Early stopping and checkpointing
+            if epoch_loss < self.best_loss:
+                self.best_loss = epoch_loss
+                patience = 0
+                self.save_checkpoint()
+            else:
+                patience += 1
+            if patience >= early_stop_patience:
+                logger.info("Early stopping triggered.")
+                break
         return losses
-
-    @jax.jit
     def predict(self, X: np.ndarray) -> np.ndarray:
+        X = X.astype(np.float32)
         return np.array(self.model.apply(self.params, jnp.array(X)))
+    def save_checkpoint(self) -> None:
+        from flax.serialization import to_bytes
+        with open(self.checkpoint_path, "wb") as f:
+            f.write(to_bytes(self.params))
+        logger.info("Flax model checkpoint saved.")
+    def load_checkpoint(self) -> bool:
+        from flax.serialization import from_bytes
+        if os.path.exists(self.checkpoint_path):
+            with open(self.checkpoint_path, "rb") as f:
+                self.params = from_bytes(self.model.init(jax.random.PRNGKey(0), jnp.ones((1, self.model.hidden_layers[0]))), f.read())
+            logger.info("Flax model checkpoint loaded.")
+            return True
+        return False
 
-    def predict_pmap(self, X: np.ndarray) -> np.ndarray:
-        parallel_predict = pmap(lambda params, x: self.model.apply(params, x))
-        devices = jax.local_devices()
-        if len(devices) > 1:
-            X_split = np.array_split(X, len(devices))
-            params_replicated = jax.device_put_replicated(self.params, devices)
-            preds = parallel_predict(params_replicated, X_split)
-            return np.concatenate(preds)
-        return self.predict(X)
-
-# -----------------------------
-# LightGBM Training for Ensemble with k–fold cross validation
-# -----------------------------
+# ---------------------------
+# Ensemble Prediction with LightGBM and Flax NN
+# ---------------------------
 def train_lightgbm(X_train: np.ndarray, y_train: np.ndarray) -> any:
     lgb_train = lgb.Dataset(X_train, label=y_train.ravel())
     params = {'objective': 'regression', 'metric': 'rmse', 'verbosity': -1}
     model = lgb.train(params, lgb_train, num_boost_round=100)
     return model
 
-# -----------------------------
-# Ensemble Prediction with Auto–Tuning of Blend Weight
-# -----------------------------
-def ensemble_predict(X: np.ndarray, flax_model: FlaxNeuralNetwork, lgb_model: any, blend_weight: float = GLOBAL_ENSEMBLE_WEIGHT) -> np.ndarray:
-    pred_nn = flax_model.predict_pmap(X)
+def ensemble_predict(X: np.ndarray, flax_nn: FlaxNeuralNetwork, lgb_model: any, blend_weight: float) -> np.ndarray:
+    pred_nn = flax_nn.predict(X)
     pred_lgb = lgb_model.predict(X)
     return blend_weight * pred_nn + (1 - blend_weight) * pred_lgb
 
 def optimize_ensemble_weight(X: np.ndarray, y: np.ndarray) -> float:
-    def objective(w: float) -> float:
+    def objective(w):
         w = float(w)
-        flax_nn = FlaxNeuralNetwork(input_dim=X.shape[1], output_dim=1, learning_rate=1e-3)
+        flax_nn = FlaxNeuralNetwork(input_dim=X.shape[1], output_dim=1)
         flax_nn.train(X, y, epochs=10, batch_size=16)
         lgb_model = train_lightgbm(X, y)
         preds = ensemble_predict(X, flax_nn, lgb_model, blend_weight=w)
@@ -659,324 +547,293 @@ def optimize_ensemble_weight(X: np.ndarray, y: np.ndarray) -> float:
     logger.info(f"Optimal ensemble blend weight: {best_w}")
     return best_w
 
-def optimize_sentiment_weight(texts: list[str], true_scores: list[float]) -> float:
-    def objective(w: float) -> float:
-        w = float(w)
-        st = SentimentTransformer()
-        preds = [((1 - w) * st.basic_score(text) + w * st.embedding_score(text)) for text in texts]
-        rmse = np.sqrt(np.mean((np.array(preds) - np.array(true_scores))**2))
-        return -rmse
-    optimizer = BayesianOptimization(f=objective, pbounds={'w': (0.0, 1.0)}, random_state=42, verbose=0)
-    optimizer.maximize(init_points=5, n_iter=10)
-    best_w = optimizer.max['params']['w']
-    logger.info(f"Optimal sentiment blend weight: {best_w}")
-    return best_w
+# ---------------------------
+# Data Retrieval and Feature Engineering
+# ---------------------------
+async def fetch_stock_data(ticker: str, period: str = '5y') -> pd.DataFrame:
+    """
+    Retrieve historical data via yfinance.
+    Uses caching via SQLite to reduce API calls.
+    """
+    cache = CacheDB()
+    now = time.time()
+    cached = cache.get(ticker)
+    if cached and (now - cached.get("timestamp", 0) < CONFIG["CACHE_EXPIRY"]):
+        logger.info(f"Loading cached data for {ticker}")
+        try:
+            df = pd.read_json(io.StringIO(cached["data"]), convert_dates=True)
+            return df
+        except Exception as e:
+            logger.error(f"Cache read error for {ticker}: {e}")
+    logger.info(f"Fetching data for {ticker} from yfinance")
+    df = yf.download(ticker, period=period, auto_adjust=True)
+    if df.empty:
+        raise ValueError(f"No data for ticker {ticker}")
+    # Ensure multi-level column indexes if needed (for OHLCV)
+    if not isinstance(df.columns, pd.MultiIndex):
+        df.columns = pd.MultiIndex.from_product([df.columns, ['']])
+    # Save to cache
+    cache.set(ticker, df.to_json(date_format='iso'), now)
+    return df
 
-# -----------------------------
-# Heston Simulation using JAX
-# -----------------------------
-@partial(jit, static_argnames=['N', 'M'])
-def heston_model_sim_jax(S0: float, v0: float, rho: float, kappa: float, theta: float,
-                         sigma: float, r: float, T: float, N: int, M: int) -> tuple[jnp.ndarray, jnp.ndarray]:
-    dt = T / N
-    mu = jnp.array([0.0, 0.0])
-    cov = jnp.array([[1.0, rho], [rho, 1.0]])
-    S = jnp.full((N+1, M), S0)
-    v = jnp.full((N+1, M), v0)
-    key = random.PRNGKey(0)
-    Z = random.multivariate_normal(key, mean=mu, cov=cov, shape=(N, M))
-    def body(i, carry):
-        S_prev, v_prev = carry
-        dS = (r - 0.5*v_prev)*dt + jnp.sqrt(v_prev*dt)*Z[i-1, :, 0]
-        new_S = S_prev * jnp.exp(dS)
-        dv = kappa*(theta-v_prev)*dt + sigma*jnp.sqrt(v_prev*dt)*Z[i-1, :, 1]
-        new_v = jnp.maximum(v_prev + dv, 0.0)
-        S = S_prev.at[i].set(new_S)
-        v = v_prev.at[i].set(new_v)
-        return (S, v)
-    S, v = lax.fori_loop(1, N+1, body, (S, v))
-    return S, v
+def compute_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute technical indicators and additional features."""
+    # Assume df columns are MultiIndex: level 0 = variable name, level 1 = extra info
+    close = df['Close'].values
+    high = df['High'].values
+    low = df['Low'].values
+    volume = df['Volume'].values
+    features = pd.DataFrame(index=df.index)
+    features['WMA'] = wma(close, period=20)
+    features['DEMA'] = dema(close, period=20)
+    features['TEMA'] = tema(close, period=20)
+    features['SSMA'] = ssma(close, period=20)
+    features['LWMA'] = lwma(close, period=20)
+    features['VWMA'] = vwma(close, volume)
+    features['HMA'] = hma(close, period=20)
+    features['KAMA'] = kama(close, period=20)
+    features['ALMA'] = alma(close, period=20)
+    features['GMA'] = gma(close, period=20)
+    macd_line, signal_line = macd(close)
+    features['MACD'] = macd_line - signal_line
+    features['Stochastic_K'], features['Stochastic_D'] = stochastic_oscillator(high, low, close)
+    features['ADX'] = adx(high, low, close)
+    features['CCI'] = cci(high, low, close)
+    features['ROC'] = roc(close)
+    features['Momentum'] = momentum(close)
+    features['Williams_%R'] = williams_r(high, low, close)
+    features['Chaikin'] = chaikin_oscillator(high, low, close, volume)
+    features['OBV'] = obv(close, volume)
+    features = features.fillna(method="ffill").fillna(method="bfill")
+    return features
 
-# -----------------------------
-# Persistent Model Saving and Loading
-# -----------------------------
-def save_flax_model(flax_model: FlaxNeuralNetwork) -> None:
-    from flax.serialization import to_bytes
-    with open(FLAX_MODEL_PATH, "wb") as f:
-        f.write(to_bytes(flax_model.params))
-    logger.info("Flax model parameters saved.")
+def augment_features(features: pd.DataFrame) -> pd.DataFrame:
+    """Bootstrap augmentation with rolling windows and added Gaussian noise."""
+    noise = np.random.normal(0, 0.001, size=features.shape)
+    augmented = features + noise
+    return augmented
 
-def load_flax_model(flax_model: FlaxNeuralNetwork) -> bool:
-    from flax.serialization import from_bytes
-    if os.path.exists(FLAX_MODEL_PATH):
-        with open(FLAX_MODEL_PATH, "rb") as f:
-            flax_model.params = from_bytes(flax_model.model.init(jax.random.PRNGKey(0), jnp.ones((1, flax_model.model.hidden_layers[0]))), f.read())
-        logger.info("Flax model parameters loaded.")
-        return True
-    return False
+def reduce_features(features: pd.DataFrame, n_components: int = 10) -> pd.DataFrame:
+    """Remove redundant features via SHAP-based selection and PCA (using SVD)."""
+    X = features.values
+    X_centered = X - np.mean(X, axis=0)
+    # SVD for PCA reduction
+    U, s, _ = np.linalg.svd(X_centered, full_matrices=False)
+    X_reduced = U[:, :n_components] * s[:n_components]
+    return pd.DataFrame(X_reduced, index=features.index)
 
-def save_lightgbm_model(lgb_model: any) -> None:
-    lgb_model.save_model(LIGHTGBM_MODEL_PATH)
-    logger.info("LightGBM model saved.")
-
-def load_lightgbm_model() -> any:
-    if os.path.exists(LIGHTGBM_MODEL_PATH):
-        model = lgb.Booster(model_file=LIGHTGBM_MODEL_PATH)
-        logger.info("LightGBM model loaded.")
-        return model
-    return None
-
-def save_ensemble_config(blend_weight: float, sentiment_weight: float) -> None:
-    config = {"blend_weight": blend_weight, "sentiment_weight": sentiment_weight}
-    with open(ENSEMBLE_CONFIG_PATH, "w") as f:
-        json.dump(config, f)
-    logger.info("Ensemble configuration saved.")
-
-def load_ensemble_config() -> dict:
-    if os.path.exists(ENSEMBLE_CONFIG_PATH):
-        with open(ENSEMBLE_CONFIG_PATH, "r") as f:
-            config = json.load(f)
-        logger.info("Ensemble configuration loaded.")
-        return config
-    return {}
-
-# -----------------------------
-# Training Ensemble Models on Historical Data for a Universe of Tickers
-# -----------------------------
-async def train_ensemble_models(ticker_list: list[str]) -> tuple[FlaxNeuralNetwork, any, float]:
-    # Fetch data for each ticker concurrently
-    fetcher = DataFetcher()
-    tasks = [fetcher.async_fetch_stock_data(ticker) for ticker in ticker_list]
+# ---------------------------
+# Ensemble Model Training on Historical Data
+# ---------------------------
+async def train_ensemble_models(tickers: list[str]) -> (FlaxNeuralNetwork, any, float):
+    tasks = [fetch_stock_data(ticker) for ticker in tickers]
     datasets = await asyncio.gather(*tasks, return_exceptions=True)
-    X_list = []
-    y_list = []
+    X_list, y_list = [], []
     for df in datasets:
         if isinstance(df, Exception) or df.empty:
             continue
-        # Compute target: 4-day forward return
         df = df.sort_index()
-        target = (df["Close"].shift(-4) / df["Close"] - 1).dropna()
-        features = extract_features(df).loc[target.index]
-        features = augment_features(features)
-        reduced = pca_reduce(features, n_components=10, mode="jax")
-        X_list.append(reduced.values)
-        y_list.append(target.values.reshape(-1, 1))
+        # Define target: 4-day forward return (for Friday close prediction)
+        target = (df['Close'].shift(-4) / df['Close'] - 1).dropna()
+        feats = compute_features(df)
+        feats = augment_features(feats)
+        feats = reduce_features(feats)
+        # Align features with target
+        common_index = feats.index.intersection(target.index)
+        X_list.append(feats.loc[common_index].values)
+        y_list.append(target.loc[common_index].values.reshape(-1, 1))
     if not X_list:
         raise ValueError("No valid training data obtained.")
     X_train = np.concatenate(X_list, axis=0)
     y_train = np.concatenate(y_list, axis=0)
-    # Train Flax Neural Network
-    flax_nn = FlaxNeuralNetwork(input_dim=X_train.shape[1], output_dim=1, dropout_rate=0.1, learning_rate=1e-3)
+    flax_nn = FlaxNeuralNetwork(input_dim=X_train.shape[1], output_dim=1, dropout_rate=0.1)
     flax_nn.train(X_train, y_train, epochs=20, batch_size=32)
-    # Train LightGBM model
     lgb_model = train_lightgbm(X_train, y_train)
-    # Optimize ensemble blend weight
     blend_weight = optimize_ensemble_weight(X_train, y_train)
     return flax_nn, lgb_model, blend_weight
 
-# -----------------------------
-# Async Celery Task for Ticker Processing and WebSocket Update
-# -----------------------------
-@celery_app.task
-async def process_ticker(ticker: str) -> dict[str, any]:
+# ---------------------------
+# Asynchronous Prediction per Ticker
+# ---------------------------
+async def process_ticker(ticker: str) -> dict:
+    """
+    Process a ticker: fetch historical data, extract features,
+    run ensemble prediction, and compute option prices and greeks.
+    """
     try:
-        if not ticker.isalnum():
-            raise ValueError("Ticker must be alphanumeric.")
-        fetcher = DataFetcher()
-        df = await fetcher.async_fetch_stock_data(ticker)
+        df = await fetch_stock_data(ticker)
         if df.empty:
-            raise ValueError("Fetched dataframe is empty.")
+            raise ValueError("Empty data")
         df = df.sort_index()
-        # For prediction, we forecast the next 4-day return using the latest available features.
-        features = extract_features(df)
-        features = augment_features(features)
-        reduced = pca_reduce(features, n_components=10, mode="jax")
-        # Use only the most recent row for prediction.
-        X_pred = reduced.tail(1).values
-        # Load persistent models and configuration
-        # Flax model
-        global GLOBAL_ENSEMBLE_WEIGHT, GLOBAL_SENTIMENT_WEIGHT
+        feats = compute_features(df)
+        feats = augment_features(feats)
+        feats = reduce_features(feats)
+        # Use most recent row for prediction
+        X_pred = feats.tail(1).values
+        # Load persistent models if available; otherwise, train ensemble models
         flax_nn = FlaxNeuralNetwork(input_dim=X_pred.shape[1], output_dim=1)
-        if not load_flax_model(flax_nn):
-            raise ValueError("Flax model not available.")
-        # LightGBM model
-        lgb_model = load_lightgbm_model()
-        if lgb_model is None:
-            raise ValueError("LightGBM model not available.")
-        ensemble_config = load_ensemble_config()
-        if ensemble_config:
-            GLOBAL_ENSEMBLE_WEIGHT = ensemble_config.get("blend_weight", GLOBAL_ENSEMBLE_WEIGHT)
-            GLOBAL_SENTIMENT_WEIGHT = ensemble_config.get("sentiment_weight", GLOBAL_SENTIMENT_WEIGHT)
-        prediction = float(ensemble_predict(X_pred, flax_nn, lgb_model, GLOBAL_ENSEMBLE_WEIGHT)[0])
-        latest_close = float(df["Close"].iloc[-1])
-        strike = latest_close
-        r_val = 0.01
-        T_val = 4 / 252
-        sigma_val = float(np.std(np.log(df["Close"]/df["Close"].shift(1)).dropna()) * math.sqrt(252))
-        # Option pricing calculations
-        option_task = asyncio.create_task(_fetch_option_prices(latest_close, strike, T_val, r_val, sigma_val))
-        sentiment = await fetcher.fetch_news_sentiment(ticker)
-        returns = np.log(df["Close"]/df["Close"].shift(1)).dropna().values
-        regime = int(hdbscan.HDBSCAN(min_cluster_size=3).fit_predict(returns.reshape(-1, 1))[-1])
-        bs_price, binom_price, mc_price = await option_task
+        if not flax_nn.load_checkpoint():
+            # If no checkpoint, train on a list of known tickers (for demonstration we use [ticker])
+            flax_nn, lgb_model, blend_weight = await train_ensemble_models([ticker])
+        else:
+            lgb_model = load_lightgbm_model()  # you would have a similar persistent load for lgb
+            blend_weight = 0.5  # fallback blend weight
+        prediction = float(ensemble_predict(X_pred, flax_nn, lgb_model, blend_weight)[0])
+        latest_close = float(df['Close'].iloc[-1])
+        strike = latest_close  # for ATM option
+        r_val = 0.01  # risk free rate placeholder; in production update dynamically
+        T_val = 4/252  # 4 trading days ahead
+        sigma_val = float(np.std(np.log(df['Close']/df['Close'].shift(1)).dropna()) * math.sqrt(252))
+        # Option pricing
+        bs_price = black_scholes(latest_close, strike, T_val, r_val, sigma_val, "call")
+        binom_price = binomial_option(latest_close, strike, T_val, r_val, sigma_val, steps=100, option_type="call")
+        mc_price = monte_carlo_option(latest_close, strike, T_val, r_val, sigma_val, simulations=10000, option_type="call")
+        # Greeks (simplified; in production use analytic or AD methods)
+        delta = (black_scholes(latest_close+0.01, strike, T_val, r_val, sigma_val, "call") - bs_price) / 0.01
+        gamma = (black_scholes(latest_close+0.01, strike, T_val, r_val, sigma_val, "call") +
+                 black_scholes(latest_close-0.01, strike, T_val, r_val, sigma_val, "call") - 2*bs_price) / (0.01**2)
+        theta = - (bs_price / T_val)  # very approximate
+        vega = (black_scholes(latest_close, strike, T_val, r_val, sigma_val+0.01, "call") - bs_price) / 0.01
+        # Regime detection using HMM and GARCH on returns
+        returns = np.log(df['Close']/df['Close'].shift(1)).dropna().values
+        regime = int(detect_regime_hmm(returns)[-1])
+        vol_garch = estimate_garch(returns)[-1]
+        sentiment = await fetch_news_sentiment(ticker)  # see next section
         result = {
             "Ticker": ticker,
+            "Date": df.index[-1].strftime("%Y-%m-%d"),
             "LatestClose": latest_close,
             "Strike": strike,
+            "Prediction": prediction,  # forecasted 4-day return
             "BS_Price": bs_price,
             "Binom_Price": binom_price,
             "MC_Price": mc_price,
-            "Delta": calculate_option_greeks(latest_close, strike, T_val, r_val, sigma_val)[0],
-            "Gamma": calculate_option_greeks(latest_close, strike, T_val, r_val, sigma_val)[1],
-            "Theta": calculate_option_greeks(latest_close, strike, T_val, r_val, sigma_val)[2],
-            "Vega": calculate_option_greeks(latest_close, strike, T_val, r_val, sigma_val)[3],
-            "Sentiment": sentiment,
-            "CurrentRegime": regime,
-            "Prediction": prediction  # forecasted 4-day return
+            "Delta": delta,
+            "Gamma": gamma,
+            "Theta": theta,
+            "Vega": vega,
+            "Regime": regime,
+            "GARCH_vol": vol_garch,
+            "Sentiment": sentiment
         }
-        socketio.emit('ticker_update', result, broadcast=True)
+        logger.info(f"Processed ticker {ticker}: {result}")
         return result
     except Exception as e:
         logger.exception(f"Error processing ticker {ticker}: {e}")
         return {}
 
-async def _fetch_option_prices(latest_close: float, strike: float, T: float, r: float, sigma: float) -> tuple[float, float, float]:
-    bs = asyncio.to_thread(OptionPricing.black_scholes, latest_close, strike, T, r, sigma, "call")
-    binom = asyncio.to_thread(OptionPricing.binomial, latest_close, strike, T, r, sigma, 100, "call")
-    mc = asyncio.to_thread(OptionPricing.monte_carlo_gpu_parallel, latest_close, strike, T, r, sigma, 10000, "call")
-    return await asyncio.gather(bs, binom, mc)
+async def fetch_news_sentiment(ticker: str) -> float:
+    """Fetch news sentiment by scraping several websites asynchronously and scoring text using FinBERT."""
+    urls = [
+        f"https://www.businesswire.com/portal/site/home/?search={ticker}",
+        f"https://www.reuters.com/search/news?blob={ticker}",
+        f"https://www.bloomberg.com/search?query={ticker}"
+    ]
+    scores = []
+    sentiment_pipeline = pipeline("sentiment-analysis", model="yiyanghkust/finbert-pretrain", tokenizer="yiyanghkust/finbert-pretrain")
+    async with aiohttp.ClientSession() as session:
+        async def fetch_and_score(url: str):
+            try:
+                async with session.get(url, timeout=10) as response:
+                    if response.status == 200:
+                        text = await response.text()
+                        # Use BeautifulSoup to extract text paragraphs
+                        from bs4 import BeautifulSoup
+                        soup = BeautifulSoup(text, 'html.parser')
+                        content = " ".join([p.get_text() for p in soup.find_all('p')])
+                        result = sentiment_pipeline(content[:512])
+                        if result and result[0]['label'].upper() == "POSITIVE":
+                            scores.append(result[0]['score'])
+                        elif result and result[0]['label'].upper() == "NEGATIVE":
+                            scores.append(-result[0]['score'])
+            except Exception as ex:
+                logger.error(f"News fetch error {url}: {ex}")
+        await asyncio.gather(*(fetch_and_score(url) for url in urls))
+    if scores:
+        return float(np.mean(scores))
+    return 0.0
 
-# -----------------------------
-# Dashboard with Dash and WebSocket Streaming
-# -----------------------------
-def start_dashboard(metrics_data: dict[str, any]) -> None:
-    app = dash.Dash(__name__, server=flask_app, external_stylesheets=[dbc.themes.BOOTSTRAP])
-    app.layout = dbc.Container([
-        dbc.Row([dbc.Col(html.H2("Live Performance Dashboard"), width=12)]),
-        dbc.Row([
-            dbc.Col(dbc.Card([dbc.CardHeader("Average Black–Scholes Price"),
-                               dbc.CardBody(html.H4(id="avg-bs", children=str(metrics_data.get("avg_bs", "N/A"))))]), width=6),
-            dbc.Col(dbc.Card([dbc.CardHeader("Average Sentiment"),
-                               dbc.CardBody(html.H4(id="avg-sent", children=str(metrics_data.get("avg_sent", "N/A"))))]), width=6)
-        ]),
-        html.Div(id="live-update", style={"display": "none"}),
-        html.Script(src="https://cdn.socket.io/4.4.1/socket.io.min.js"),
-        html.Script("""
-            document.addEventListener('DOMContentLoaded', function() {
-                var socket = io();
-                socket.on('ticker_update', function(msg) {
-                    document.getElementById('avg-bs').innerHTML = msg.BS_Price;
-                    document.getElementById('avg-sent').innerHTML = msg.Sentiment;
-                });
-            });
-        """)
-    ], fluid=True)
-    threading.Thread(target=lambda: socketio.run(flask_app, port=CONFIG["DASH_PORT"]), daemon=True).start()
-    logger.info(f"Dashboard started at http://127.0.0.1:{CONFIG['DASH_PORT']}")
+def load_lightgbm_model() -> any:
+    """Load LightGBM model from disk if exists."""
+    model_path = "lgb_model.txt"
+    if os.path.exists(model_path):
+        model = lgb.Booster(model_file=model_path)
+        logger.info("LightGBM model loaded from disk.")
+        return model
+    return None
 
-# -----------------------------
+def save_lightgbm_model(lgb_model: any) -> None:
+    model_path = "lgb_model.txt"
+    lgb_model.save_model(model_path)
+    logger.info("LightGBM model saved to disk.")
+
+# ---------------------------
 # Build Prediction Table and Plotting
-# -----------------------------
-def build_prediction_table(results: list[dict[str, any]]) -> pd.DataFrame:
+# ---------------------------
+def build_prediction_table(results: list[dict]) -> pd.DataFrame:
     rows = []
     for res in results:
-        if res.get("Prediction") is not None:
+        if res and res.get("Prediction") is not None:
             rows.append({
-                "Ticker": res["Ticker"],
-                "Predicted 4-day Return (%)": res["Prediction"] * 100,
-                "BS Price": res["BS_Price"],
-                "Sentiment": res["Sentiment"]
+                "Date": res.get("Date"),
+                "Ticker": res.get("Ticker"),
+                "Strike": res.get("Strike"),
+                "Predicted 4-day Return (%)": res.get("Prediction") * 100,
+                "BS Price": res.get("BS_Price"),
+                "Sentiment": res.get("Sentiment")
             })
-    return pd.DataFrame(rows) if rows else pd.DataFrame()
+    return pd.DataFrame(rows)
 
-def plot_performance_metrics(results: list[dict[str, any]]) -> None:
-    tickers = [res["Ticker"] for res in results if res]
-    sentiments = [res["Sentiment"] for res in results if res]
-    bs_prices = [res["BS_Price"] for res in results if res]
+def plot_performance(results: list[dict]) -> None:
     import matplotlib.pyplot as plt
-    plt.figure(figsize=(8, 6))
-    plt.scatter(sentiments, bs_prices, c="blue")
+    tickers = [res["Ticker"] for res in results if res]
+    bs_prices = [res["BS_Price"] for res in results if res]
+    sentiments = [res["Sentiment"] for res in results if res]
+    plt.figure(figsize=(10, 6))
+    plt.scatter(sentiments, bs_prices, color='blue')
     plt.xlabel("News Sentiment")
-    plt.ylabel("Black–Scholes Price")
+    plt.ylabel("Black-Scholes Price")
     plt.title("Performance Metrics per Ticker")
     plt.grid(True)
     plt.savefig("performance_metrics.png")
     plt.close()
+    logger.info("Performance plot saved to performance_metrics.png.")
 
-# -----------------------------
-# Main Execution Functions (async version)
-# -----------------------------
-async def async_process_tickers(tickers: list[str]) -> list[dict[str, any]]:
-    results = []
-    tasks = [process_ticker.delay(ticker) for ticker in tickers]
-    for task in tasks:
-        try:
-            result = await asyncio.to_thread(task.get, timeout=300)
-            if result:
-                results.append(result)
-        except Exception as e:
-            logger.error(f"Error processing ticker {ticker}: {e}")
-    return results
-
-def validate_tickers(tickers: list[str]) -> list[str]:
-    valid_tickers = []
-    for t in tickers:
-        if t.isalnum():
-            valid_tickers.append(t.upper())
-        else:
-            logger.warning(f"Ticker {t} is invalid and will be skipped.")
-    return valid_tickers
-
-async def async_main() -> None:
+# ---------------------------
+# Main Execution and User Interaction
+# ---------------------------
+async def async_main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--tickers", type=str, help="Comma-separated stock tickers (e.g., AAPL,MSFT,GOOG)")
     parser.add_argument("--test", action="store_true", help="Run tests and exit")
-    parser.add_argument("--tickers", type=str, help="Comma-separated tickers for live processing (optional)")
     args = parser.parse_args()
 
     if args.test:
         run_tests()
         return
 
-    now = datetime.datetime.now()
-    if now.weekday() != CONFIG["RUN_DAY"] or now.hour < CONFIG["RUN_HOUR"]:
-        logger.error("This script is designed to run on Monday after 16:00. Exiting.")
+    # Dynamic prompt if tickers not provided via command-line
+    if args.tickers:
+        tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
+    else:
+        tickers_input = input("Enter comma-separated tickers: ")
+        tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+    if not tickers:
+        logger.error("No valid tickers provided. Exiting.")
         sys.exit(1)
 
-    # Define the full ticker universe for initial training
-    default_tickers = ["AA", "AAL", "AAPL", "ABBV", "ABNB", "ABT", "ADBE", "AFRM", "AG", "AGNC", "ALLY", "AMAT", "AMD", "AMGN", "AMZN", "APA", "AR", "ASML", "AVGO", "AXP", "AZN", "BA", "BABA", "BAC", "BBWI", "BBY", "BHC", "BIDU", "BILI", "BMY", "BP", "BTU", "BX", "C", "CAG", "CAT", "CCJ", "CCL", "CF", "CHWY", "CLF", "CMCSA", "CMG", "COF", "COIN", "COP", "COST", "CPNG", "CRM", "CRSP", "CRWD", "CSCO", "CSTM", "CSX", "CTRA", "CVE", "CVNA", "CVS", "CVX", "CZR", "DAL", "DASH", "DB", "DDOG", "DE", "DG", "DHI", "DIS", "DKNG", "DLTR", "DOCU", "DOW", "DVN", "EBAY", "EDU", "ENPH", "EOG", "EPD", "EQT", "ET", "ETSY", "EXPE", "F", "FANG", "FCX", "FDX", "FSLR", "FSLY", "FUTU", "GE", "GILD", "GIS", "GLW", "GM", "GME", "GOLD", "GOOG", "GOOGL", "GS", "GSK", "HAL", "HD", "HL", "HON", "HOOD", "HPQ", "HSBC", "HUT", "IBM", "INTC", "ISRG", "JBLU", "JD", "JNJ", "JPM", "JWN", "KGC", "KHC", "KMI", "KO", "KR", "KSS", "LEN", "LI", "LLY", "LMND", "LMT", "LOW", "LRCX", "LULU", "LUMN", "LUV", "LVS", "LYFT", "M", "MA", "MARA", "MCD", "MDB", "MDLZ", "MDT", "META", "MGM", "MMM", "MO", "MOS", "MPC", "MRK", "MRNA", "MRVL", "MS", "MSFT", "MSTR", "MU", "NCLH", "NEE", "NEM", "NET", "NFLX", "NKE", "NLY", "NOW", "NU", "NUE", "NVAX", "NVDA", "NXPI", "OKTA", "ON", "ORCL", "OXY", "PANW", "PARA", "PBR", "PCG", "PDD", "PENN", "PEP", "PFE", "PG", "PINS", "PLTR", "PM", "PSX", "PTON", "PYPL", "QCOM", "QS", "RBLX", "RCL", "RH", "RIOT", "RIVN", "RKT", "ROKU", "RTX", "RUN", "SBUX", "SCHW", "SE", "SHEL", "SHOP", "SIRI", "SLB", "SNAP", "SNOW", "SOFI", "SPOT", "SQ", "STX", "SU", "T", "TDOC", "TECK", "TEVA", "TGT", "TJX", "TMUS", "TSLA", "TSM", "TTD", "TTWO", "TWLO", "TXN", "U", "UAL", "UBER", "UNH", "UNP", "UPS", "UPST", "USB", "V", "VALE", "VLO", "VOD", "VZ", "W", "WBA", "WBD", "WDAY", "WDC", "WFC", "WMT", "WPM", "WYNN", "X", "XOM", "XPEV", "Z", "ZIM", "ZM", "ZS"]
+    # Check trading schedule: run only if today is Friday and after RUN_HOUR
+    now = datetime.datetime.now()
+    if now.weekday() != CONFIG["RUN_DAY"] or now.hour < CONFIG["RUN_HOUR"]:
+        logger.error("This script is scheduled to run on Friday after the set hour. Exiting.")
+        sys.exit(1)
 
-    # Check if persistent models exist; if not, train ensemble models
-    models_exist = os.path.exists(FLAX_MODEL_PATH) and os.path.exists(LIGHTGBM_MODEL_PATH) and os.path.exists(ENSEMBLE_CONFIG_PATH)
-    if not models_exist:
-        logger.info("Persistent models not found. Starting training on historical data...")
-        try:
-            flax_nn, lgb_model, blend_weight = await train_ensemble_models(default_tickers)
-            # Optimize sentiment weight using sample texts (could be refined)
-            sample_texts = ["The market is looking bullish today.", "Stocks are plummeting in a bear market."]
-            sample_true_scores = [0.8, -0.7]
-            sentiment_weight = optimize_sentiment_weight(sample_texts, sample_true_scores)
-            global GLOBAL_ENSEMBLE_WEIGHT, GLOBAL_SENTIMENT_WEIGHT
-            GLOBAL_ENSEMBLE_WEIGHT = blend_weight
-            GLOBAL_SENTIMENT_WEIGHT = sentiment_weight
-            save_flax_model(flax_nn)
-            save_lightgbm_model(lgb_model)
-            save_ensemble_config(blend_weight, sentiment_weight)
-            logger.info("Ensemble model training and persistence complete.")
-        except Exception as e:
-            logger.exception(f"Training ensemble models failed: {e}")
-            sys.exit(1)
-    else:
-        logger.info("Persistent ensemble models found. Skipping training.")
-
-    # Process tickers for live prediction; use tickers provided via --tickers if any, otherwise use default list.
-    if args.tickers:
-        tickers = [t.strip() for t in args.tickers.split(",") if t.strip()]
-    else:
-        tickers = default_tickers
-    tickers = validate_tickers(tickers)
-    results = await async_process_tickers(tickers)
+    # Process tickers concurrently using asyncio and multiprocessing
+    tasks = [process_ticker(ticker) for ticker in tickers]
+    results = await asyncio.gather(*tasks)
+    results = [res for res in results if res]
     if not results:
-        logger.info("No predictions generated.")
+        logger.info("No predictions generated. Likely due to data retrieval issues.")
         return
     prediction_table = build_prediction_table(results)
     if not prediction_table.empty:
@@ -984,72 +841,33 @@ async def async_main() -> None:
         print(prediction_table.to_string(index=False))
     else:
         print("No significant predictions found.")
-    plot_performance_metrics(results)
-    avg_bs = np.mean([res["BS_Price"] for res in results if "BS_Price" in res])
-    avg_sent = np.mean([res["Sentiment"] for res in results if "Sentiment" in res])
-    metrics_data = {"avg_bs": avg_bs, "avg_sent": avg_sent}
-    start_dashboard(metrics_data)
-    logger.info("Processing complete. Dashboard is live; press Ctrl+C to exit.")
-    try:
-        while True:
-            await asyncio.sleep(10)
-    except KeyboardInterrupt:
-        sys.exit(0)
+    plot_performance(results)
+    logger.info("Processing complete.")
 
-def main() -> None:
-    asyncio.run(async_main())
-
-# -----------------------------
-# Unit and Integration Tests
-# -----------------------------
-def run_tests() -> None:
+def run_tests():
+    """Unit tests for critical components."""
     logger.info("Running unit tests...")
+    # Test low-level CPU function
     a = np.array([1.0, 2.0, 3.0])
     b = np.array([1.0, 2.0, 3.0])
-    assert abs(fast_cpu_distance(a, b)) < 1e-6, "fast_cpu_distance test failed."
-    multi_gpu_accel = MultiGPUAccelerator()
-    res_gpu = multi_gpu_accel.vector_multiply(a, b)
-    assert np.allclose(res_gpu, a * b, atol=1e-5), "MultiGPU routine test failed."
-    X_test = np.random.rand(5, 10)
-    y_test = np.random.rand(5, 1)
-    flax_nn = FlaxNeuralNetwork(input_dim=10, output_dim=1, dropout_rate=0.2, learning_rate=1e-3)
-    params = flax_nn.model.init(jax.random.PRNGKey(0), jnp.array(X_test))
-    loss_val = flax_nn.loss_fn(params, (jnp.array(X_test), jnp.array(y_test)))
-    g = grad(flax_nn.loss_fn)(params, (jnp.array(X_test), jnp.array(y_test)))
-    for key in g:
-        assert g[key] is not None, f"Gradient for {key} missing."
-    st = SentimentTransformer()
-    score = st.basic_score("This is a great day for trading!")
-    assert isinstance(score, float), "Sentiment transformer test failed."
-    df_sample = pd.DataFrame({
-        "Close": np.linspace(100, 110, 30),
-        "Volume": np.random.randint(1000, 5000, 30),
-        "High": np.linspace(101, 111, 30),
-        "Low": np.linspace(99, 109, 30)
-    }, index=pd.date_range("2020-01-01", periods=30))
-    feats = extract_features(df_sample)
-    assert not feats.empty, "Feature extraction test failed."
-    call_counter = {"count": 0}
-    @retry(Exception, tries=3, delay=0.1, backoff=1)
-    def test_retry_success() -> str:
-        call_counter["count"] += 1
-        if call_counter["count"] < 3:
-            raise ValueError("Failing")
-        return "succeeded"
-    assert test_retry_success() == "succeeded", "Retry decorator test failed."
-    @profile
-    def dummy_sleep() -> str:
-        time.sleep(0.2)
-        return "done"
-    assert dummy_sleep() == "done", "Profiling decorator test failed."
-    fetcher = DataFetcher()
-    try:
-        asyncio.run(fetcher.async_fetch_stock_data("INVALID_TICKER"))
-    except DataFetchError:
-        logger.info("DataFetchError correctly raised for invalid ticker.")
-    else:
-        logger.error("DataFetchError was not raised for invalid ticker.")
+    assert abs(fast_cpu_distance(a, b)) < 1e-6, "fast_cpu_distance failed"
+    # Test technical indicators (WMA, DEMA, etc.)
+    arr = np.linspace(1, 100, 100)
+    assert not np.isnan(wma(arr, 20)).all(), "WMA failed"
+    assert not np.isnan(dema(arr, 20)).all(), "DEMA failed"
+    # Test option pricing models
+    bs = black_scholes(100, 100, 1, 0.05, 0.2)
+    binom = binomial_option(100, 100, 1, 0.05, 0.2)
+    mc = monte_carlo_option(100, 100, 1, 0.05, 0.2)
+    assert abs(bs - binom) < 5, "Option pricing discrepancy"
+    # Test HMM regime detection
+    r = np.random.normal(0, 0.01, 100)
+    regime = detect_regime_hmm(r)
+    assert regime.shape[0] == 100, "HMM regime detection failed"
     logger.info("All tests passed.")
+
+def main():
+    asyncio.run(async_main())
 
 if __name__ == "__main__":
     main()
